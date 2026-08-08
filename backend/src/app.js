@@ -13,6 +13,9 @@ import { errorHandler, notFound } from './middleware/errorHandler.js';
 import documentRoutes from './routes/documentRoutes.js';
 import chatRoutes from './routes/chatRoutes.js';
 import healthRoutes from './routes/healthRoutes.js';
+import authRoutes from './routes/authRoutes.js';
+import mlRoutes from './routes/mlRoutes.js';
+import agentRoutes from './routes/agentRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -23,15 +26,17 @@ const app = express();
 app.use(helmet());
 app.use(compression());
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: config.rateLimitWindowMs,
-  max: config.rateLimitMaxRequests,
-  message: {
-    error: 'Too many requests from this IP, please try again later.'
-  }
-});
-app.use('/api/', limiter);
+// Rate limiting - only in production to prevent developer lockout during rapid UI testing/reloads
+if (config.nodeEnv === 'production') {
+  const limiter = rateLimit({
+    windowMs: config.rateLimitWindowMs,
+    max: config.rateLimitMaxRequests,
+    message: {
+      error: 'Too many requests from this IP, please try again later.'
+    }
+  });
+  app.use('/api/', limiter);
+}
 
 // CORS configuration
 app.use(cors({
@@ -44,6 +49,9 @@ app.use(cors({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// Serve files statically
+app.use('/api/files', express.static(join(__dirname, '../uploads')));
+
 // Logging middleware
 app.use((req, res, next) => {
   logger.info(`${req.method} ${req.path} - ${req.ip}`);
@@ -52,8 +60,11 @@ app.use((req, res, next) => {
 
 // API Routes
 app.use('/api/health', healthRoutes);
+app.use('/api/auth', authRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/ml', mlRoutes);
+app.use('/api/agents', agentRoutes);
 
 // Error handling middleware
 app.use(notFound);
@@ -70,5 +81,15 @@ app.listen(PORT, () => {
   logger.info(`🚀 Server running on port ${PORT} in ${config.nodeEnv} mode`);
   logger.info(`📚 RAG Backend API ready at http://localhost:${PORT}/api`);
 });
+
+// Register global error and rejection handlers to prevent crash/shutdown on stream or API failures
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+});
+
+// Nodemon reload trigger comment.
 
 export default app;

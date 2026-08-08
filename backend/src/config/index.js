@@ -44,6 +44,9 @@ const config = {
   // AI Model Configuration
   temperature: 0.7,
   maxTokens: 1000,
+
+  // JWT Configuration
+  jwtSecret: process.env.JWT_SECRET || 'local-secret-key-default',
 };
 
 // Validate required environment variables

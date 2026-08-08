@@ -44,12 +44,14 @@ const COLORS = [
   '#3b82f6', // blue
 ];
 
-export const CSVChart = ({ type, labels, datasets, title }: CSVChartProps) => {
+export const CSVChart = ({ type, labels = [], datasets = [], title }: CSVChartProps) => {
   // Transform data for Recharts
-  const chartData = labels.map((label, index) => {
-    const dataPoint: Record<string, string | number> = { name: label };
-    datasets.forEach((dataset) => {
-      dataPoint[dataset.label] = dataset.data[index] || 0;
+  const chartData = (labels || []).map((label, index) => {
+    const dataPoint: Record<string, string | number> = { name: label || '' };
+    (datasets || []).forEach((dataset) => {
+      if (dataset && dataset.label && dataset.data) {
+        dataPoint[dataset.label] = dataset.data[index] || 0;
+      }
     });
     return dataPoint;
   });
@@ -85,10 +87,10 @@ export const CSVChart = ({ type, labels, datasets, title }: CSVChartProps) => {
                 }}
               />
               <Legend wrapperStyle={{ color: '#64748b' }} />
-              {datasets.map((dataset, index) => (
+              {(datasets || []).map((dataset, index) => (
                 <Bar
-                  key={dataset.label}
-                  dataKey={dataset.label}
+                  key={dataset?.label}
+                  dataKey={dataset?.label}
                   fill={COLORS[index % COLORS.length]}
                   radius={[4, 4, 0, 0]}
                 />
@@ -126,11 +128,11 @@ export const CSVChart = ({ type, labels, datasets, title }: CSVChartProps) => {
                 }}
               />
               <Legend wrapperStyle={{ color: '#64748b' }} />
-              {datasets.map((dataset, index) => (
+              {(datasets || []).map((dataset, index) => (
                 <Line
-                  key={dataset.label}
+                  key={dataset?.label}
                   type="monotone"
-                  dataKey={dataset.label}
+                  dataKey={dataset?.label}
                   stroke={COLORS[index % COLORS.length]}
                   strokeWidth={2}
                   dot={{ fill: COLORS[index % COLORS.length], strokeWidth: 2 }}
@@ -169,11 +171,11 @@ export const CSVChart = ({ type, labels, datasets, title }: CSVChartProps) => {
                 }}
               />
               <Legend wrapperStyle={{ color: '#64748b' }} />
-              {datasets.map((dataset, index) => (
+              {(datasets || []).map((dataset, index) => (
                 <Area
-                  key={dataset.label}
+                  key={dataset?.label}
                   type="monotone"
-                  dataKey={dataset.label}
+                  dataKey={dataset?.label}
                   stroke={COLORS[index % COLORS.length]}
                   fill={COLORS[index % COLORS.length]}
                   fillOpacity={0.3}
@@ -185,9 +187,9 @@ export const CSVChart = ({ type, labels, datasets, title }: CSVChartProps) => {
 
       case 'pie':
         // For pie chart, we need to restructure data
-        const pieData = labels.map((label, index) => ({
-          name: label,
-          value: datasets[0]?.data[index] || 0,
+        const pieData = (labels || []).map((label, index) => ({
+          name: label || '',
+          value: (datasets || [])[0]?.data?.[index] || 0,
         }));
 
         return (

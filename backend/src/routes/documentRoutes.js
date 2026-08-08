@@ -15,6 +15,7 @@ import pptxService from '../services/pptxService.js';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { requireAuth } from '../middleware/authMiddleware.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -26,11 +27,11 @@ const ALLOWED_MIME_TYPES = [
   'application/pdf',
   'text/csv',
   'application/vnd.ms-excel',
-  'text/plain', // Some systems report CSV as text/plain
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // DOCX
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',       // XLSX
-  'application/vnd.ms-excel',                                                 // XLS
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation', // PPTX
+  'text/plain',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   'application/zip',
   'application/x-zip-compressed'
 ];
@@ -57,15 +58,12 @@ const ALLOWED_EXTENSIONS = ['.pdf', '.csv', '.docx', '.xlsx', '.pptx', '.zip'];
 const fileFilter = (req, file, cb) => {
   const ext = path.extname(file.originalname).toLowerCase();
 
-  logger.info(`Validating file: ${file.originalname}, Type: ${file.mimetype}, Size: ${req.headers['content-length']}`);
+  logger.info(`Validating file: ${file.originalname}, Type: ${file.mimetype}`);
 
-  // Check by extension first (more reliable)
-  if (ALLOWED_EXTENSIONS.includes(ext)) {
-    cb(null, true);
-  } else if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+  if (ALLOWED_EXTENSIONS.includes(ext) || ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    logger.error(`File rejected: ${file.originalname}. Extension: ${ext}, Mime: ${file.mimetype} is not allowed.`);
+    logger.error(`File rejected: ${file.originalname}. Extension: ${ext}, Mime: ${file.mimetype} not allowed.`);
     cb(new AppError(`File type not allowed. Sent: ${ext} (${file.mimetype})`, 400));
   }
 };
@@ -78,7 +76,6 @@ const upload = multer({
   fileFilter: fileFilter
 });
 
-// Helper to detect file type
 const getFileType = (filename) => {
   const ext = path.extname(filename).toLowerCase();
   if (ext === '.csv') return 'csv';
@@ -90,29 +87,32 @@ const getFileType = (filename) => {
   return 'unknown';
 };
 
-// Process a single file path
-const processSingleFile = async (filePath, originalName, mode) => {
+// Process a single file path scoped to user
+const processSingleFile = async (filePath, originalName, mode, userId) => {
   const fileType = getFileType(originalName);
 
   if (fileType === 'csv') {
     return await csvService.processCSV(filePath, {
       originalFileName: originalName,
-      mode
+      mode,
+      userId
     });
   } else if (fileType === 'pdf') {
-    return await ragService.processDocument(filePath, { mode });
+    return await ragService.processDocument(filePath, { mode, userId });
   } else if (fileType === 'docx') {
     const extracted = await docxService.extractText(filePath);
     return await ragService.processRawText(extracted.documents, {
       mode,
       cleanFileName: extracted.cleanFileName,
       fullFileName: extracted.fullFileName,
-      filePath: filePath
+      filePath: filePath,
+      userId
     });
   } else if (fileType === 'xlsx') {
     return await excelService.processExcel(filePath, {
       originalFileName: originalName,
-      mode
+      mode,
+      userId
     });
   } else if (fileType === 'pptx') {
     const extracted = await pptxService.extractText(filePath);
@@ -120,15 +120,16 @@ const processSingleFile = async (filePath, originalName, mode) => {
       mode,
       cleanFileName: extracted.cleanFileName,
       fullFileName: extracted.fullFileName,
-      filePath: filePath
+      filePath: filePath,
+      userId
     });
   } else {
-    throw new Error(`Unsupported file type inside ZIP: ${originalName}`);
+    throw new Error(`Unsupported file type: ${originalName}`);
   }
 };
 
-// Upload document endpoint (PDF or CSV)
-router.post('/upload', upload.single('document'), async (req, res, next) => {
+// Upload document endpoint (PDF, CSV, Word, PPTX, Excel, ZIP) - SECURED
+router.post('/upload', requireAuth, upload.single('document'), async (req, res, next) => {
   try {
     if (!req.file) {
       throw new AppError('No file uploaded', 400);
@@ -136,10 +137,10 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
 
     const fileType = getFileType(req.file.originalname);
     const mode = req.body.mode || 'replace';
+    const userId = req.user.id;
 
-    logger.info(`File uploaded: ${req.file.filename} (type: ${fileType}, mode: ${mode})`);
+    logger.info(`File uploaded: ${req.file.filename} (type: ${fileType}, mode: ${mode}) for user ${userId}`);
 
-    // Validate mode
     if (!['replace', 'append'].includes(mode)) {
       throw new AppError('Invalid mode. Use "replace" or "append"', 400);
     }
@@ -151,7 +152,6 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
       const zipEntries = zip.getEntries();
       const extractionPath = path.join(path.dirname(req.file.path), 'extracted-' + Date.now());
 
-      // Extract all
       zip.extractAllTo(extractionPath, true);
 
       const processedFiles = [];
@@ -165,7 +165,6 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
         }
 
         const entryPath = path.join(extractionPath, entry.entryName);
-        // Ensure we only process supported files
         const entryType = getFileType(entry.name);
         if (entryType === 'unknown') {
           logger.warn(`Skipping unsupported file in ZIP: ${entry.name}`);
@@ -174,7 +173,7 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
 
         try {
           logger.info(`Processing extracted file: ${entry.name}`);
-          const entryResult = await processSingleFile(entryPath, entry.name, 'append'); // Always append for zip contents
+          const entryResult = await processSingleFile(entryPath, entry.name, 'append', userId);
           processedFiles.push({
             name: entry.name,
             status: 'success',
@@ -190,9 +189,12 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
         }
       }
 
-      // Cleanup
+      // Cleanup ZIP extraction folder
       try {
         await fsPromises.rm(extractionPath, { recursive: true, force: true });
+        if (fs.existsSync(req.file.path)) {
+          await fsPromises.unlink(req.file.path);
+        }
       } catch (cleanupErr) {
         logger.error('Failed to cleanup extracted files', cleanupErr);
       }
@@ -205,7 +207,7 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
       };
 
     } else {
-      result = await processSingleFile(req.file.path, req.file.originalname, mode);
+      result = await processSingleFile(req.file.path, req.file.originalname, mode, userId);
     }
 
     res.json({
@@ -219,84 +221,86 @@ router.post('/upload', upload.single('document'), async (req, res, next) => {
   }
 });
 
-// CSV Query endpoint
-router.post('/csv/query', async (req, res, next) => {
-  try {
-    const { question } = req.body;
 
+
+// CSV Query endpoint - SECURED
+router.post('/csv/query', requireAuth, async (req, res, next) => {
+  try {
+    const { question, documentId } = req.body;
     if (!question || typeof question !== 'string') {
       throw new AppError('Question is required', 400);
     }
 
-    const result = await csvService.queryCSV(question);
+    const result = await csvService.queryCSV(question, req.user.id, documentId);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Get CSV data
-router.get('/csv/data', async (req, res, next) => {
+// Get CSV data - SECURED
+router.get('/csv/data', requireAuth, async (req, res, next) => {
   try {
-    const { limit = 100, offset = 0 } = req.query;
-    const result = await csvService.getData(parseInt(limit), parseInt(offset));
+    const { limit = 100, offset = 0, documentId } = req.query;
+    const result = await csvService.getData(req.user.id, parseInt(limit), parseInt(offset), documentId);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Get CSV stats
-router.get('/csv/stats', async (req, res, next) => {
+// Get CSV stats - SECURED
+router.get('/csv/stats', requireAuth, async (req, res, next) => {
   try {
-    const result = await csvService.getStats();
+    const { documentId } = req.query;
+    const result = await csvService.getStats(req.user.id, documentId);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Excel Query endpoint
-router.post('/excel/query', async (req, res, next) => {
+// Excel Query endpoint - SECURED
+router.post('/excel/query', requireAuth, async (req, res, next) => {
   try {
-    const { question } = req.body;
-
+    const { question, documentId } = req.body;
     if (!question || typeof question !== 'string') {
       throw new AppError('Question is required', 400);
     }
 
-    const result = await excelService.queryExcel(question);
+    const result = await excelService.queryExcel(question, req.user.id, documentId);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Get Excel data
-router.get('/excel/data', async (req, res, next) => {
+// Get Excel data - SECURED
+router.get('/excel/data', requireAuth, async (req, res, next) => {
   try {
-    const { limit = 100, offset = 0 } = req.query;
-    const result = await excelService.getData(parseInt(limit), parseInt(offset));
+    const { limit = 100, offset = 0, documentId } = req.query;
+    const result = await excelService.getData(req.user.id, parseInt(limit), parseInt(offset), documentId);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Get Excel stats
-router.get('/excel/stats', async (req, res, next) => {
+// Get Excel stats - SECURED
+router.get('/excel/stats', requireAuth, async (req, res, next) => {
   try {
-    const result = await excelService.getStats();
+    const { documentId } = req.query;
+    const result = await excelService.getStats(req.user.id, documentId);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Get system status
-router.get('/status', async (req, res, next) => {
+// Get system status - SECURED
+router.get('/status', requireAuth, async (req, res, next) => {
   try {
-    const status = await ragService.getStatus();
+    const status = await ragService.getStatus(req.user.id);
     res.json({
       success: true,
       ...status
@@ -306,25 +310,35 @@ router.get('/status', async (req, res, next) => {
   }
 });
 
-// Get documents list
-router.get('/', async (req, res, next) => {
+// Get documents list - SECURED
+router.get('/', requireAuth, async (req, res, next) => {
   try {
-    const result = await ragService.getDocuments();
+    const result = await ragService.getDocuments(req.user.id);
     res.json(result);
   } catch (error) {
     next(error);
   }
 });
 
-// Reset system
-router.post('/reset', async (req, res, next) => {
+// Delete a specific document - SECURED
+router.delete('/:id', requireAuth, async (req, res, next) => {
   try {
-    const ragResult = await ragService.reset();
-    const csvResult = csvService.reset();
-    const excelResult = excelService.reset();
+    const result = await ragService.deleteDocument(req.user.id, req.params.id);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Reset system - SECURED
+router.post('/reset', requireAuth, async (req, res, next) => {
+  try {
+    const ragResult = await ragService.reset(req.user.id);
+    const csvResult = csvService.reset(req.user.id);
+    const excelResult = excelService.reset(req.user.id);
     res.json({
       success: true,
-      message: 'System reset - all documents, CSV, and Excel data cleared',
+      message: 'User workspace cleared successfully',
       rag: ragResult,
       csv: csvResult,
       excel: excelResult

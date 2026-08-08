@@ -27,9 +27,8 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { queryDocuments, queryCSV, queryExcel } from "@/api";
 import { CSVChart } from "@/components/CSVChart";
-import type { ChatMessage, SourceDocument, ChartData } from "@/types";
+import type { ChatMessage, SourceDocument, UploadedDocument } from "@/types";
 import { cn } from "@/lib/utils";
 
 interface ChatSession {
@@ -44,10 +43,54 @@ type DataSource = 'pdf' | 'csv' | 'excel' | 'both' | 'none';
 interface ChatProps {
   documentsReady?: boolean;
   dataSource?: DataSource;
+  onSourceClick?: (source: SourceDocument) => void;
+  selectedDocumentIds?: string[];
+  onToggleSelect?: (id: string) => void;
+  uploadedDocuments?: UploadedDocument[];
+  selectedAgentId?: string | null;
 }
 
 const generateId = (): string => {
   return `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+};
+
+const recordQueryTelemetry = (latencyMs: number) => {
+  try {
+    const saved = localStorage.getItem('rag_query_telemetry');
+    let telemetry = [];
+    if (saved) {
+      telemetry = JSON.parse(saved);
+    } else {
+      telemetry = [
+        { date: 'Mon', queries: 0, latency: 0 },
+        { date: 'Tue', queries: 0, latency: 0 },
+        { date: 'Wed', queries: 0, latency: 0 },
+        { date: 'Thu', queries: 0, latency: 0 },
+        { date: 'Fri', queries: 0, latency: 0 },
+        { date: 'Sat', queries: 0, latency: 0 },
+        { date: 'Sun', queries: 0, latency: 0 },
+      ];
+    }
+
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const currentDay = days[new Date().getDay()];
+
+    telemetry = telemetry.map((t: any) => {
+      if (t.date === currentDay) {
+        const oldQueries = t.queries || 0;
+        const oldLatency = t.latency || 0;
+        const newQueries = oldQueries + 1;
+        const newLatency = Math.round((oldLatency * oldQueries + latencyMs) / newQueries);
+        return { ...t, queries: newQueries, latency: newLatency };
+      }
+      return t;
+    });
+
+    localStorage.setItem('rag_query_telemetry', JSON.stringify(telemetry));
+    localStorage.setItem('rag_query_telemetry_actual', 'true');
+  } catch (e) {
+    console.error('Failed to record query telemetry', e);
+  }
 };
 
 const PDF_SUGGESTIONS = [
@@ -62,7 +105,15 @@ const CSV_SUGGESTIONS = [
   "What are the top values?",
 ];
 
-export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps) => {
+export const Chat = ({ 
+  documentsReady = false, 
+  dataSource = 'none', 
+  onSourceClick, 
+  selectedDocumentIds = [], 
+  onToggleSelect,
+  uploadedDocuments = [],
+  selectedAgentId = null 
+}: ChatProps) => {
   const [sessions, setSessions] = useState<ChatSession[]>(() => {
     try {
       const saved = localStorage.getItem('rag_chat_sessions');
@@ -85,6 +136,7 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
   const [isLoading, setIsLoading] = useState(false);
   const [expandedSources, setExpandedSources] = useState<Record<string, boolean>>({});
   const [showHistory, setShowHistory] = useState(false);
+  const [showScopeSelector, setShowScopeSelector] = useState(false);
 
   useEffect(() => {
     localStorage.setItem('rag_chat_sessions', JSON.stringify(sessions));
@@ -201,58 +253,144 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
     setInputValue("");
     setIsLoading(true);
 
+    const startTime = Date.now();
+    const assistantMessageId = generateId();
+
     try {
       let answer = "";
-      let sources: SourceDocument[] = [];
-      let chartData: ChartData | undefined;
 
-      // Choose the appropriate query endpoint based on data source
-      if (dataSource === 'csv') {
-        // CSV only - use CSV query endpoint
-        const response = await queryCSV(content.trim());
-        answer = response.answer;
-        if (response.chartData) {
-          chartData = response.chartData;
+      const historyPayload = messages
+        .filter(msg => msg.content && msg.content.trim() !== '')
+        .map(msg => ({
+          role: msg.role,
+          content: msg.content
+        }));
+
+      // Use the unified streaming query endpoint for all active document data sources
+      if (dataSource === 'pdf' || dataSource === 'both' || dataSource === 'csv' || dataSource === 'excel') {
+        
+        // Add placeholder message for streaming text
+        const placeholderMessage: ChatMessage = {
+          id: assistantMessageId,
+          content: "",
+          role: "assistant",
+          timestamp: new Date(),
+          sources: undefined,
+        };
+        setMessages((prev) => [...prev, placeholderMessage]);
+
+        const jwtToken = localStorage.getItem('rag_jwt_token');
+        const retrievalMode = localStorage.getItem('rag_retrieval_mode') || 'hybrid';
+        const topK = Number(localStorage.getItem('rag_top_k')) || 6;
+        const useReranking = localStorage.getItem('rag_use_reranking') !== 'false';
+
+        const fetchResponse = await fetch('/api/chat/query', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${jwtToken}`
+          },
+          body: JSON.stringify({
+            question: content.trim(),
+            history: historyPayload,
+            selectedDocumentIds,
+            agentId: selectedAgentId,
+            stream: true,
+            retrievalMode,
+            topK,
+            useReranking
+          })
+        });
+
+        if (!fetchResponse.ok) {
+          const errBody = await fetchResponse.json().catch(() => ({}));
+          throw new Error(errBody?.error?.message || `API error! Status: ${fetchResponse.status}`);
         }
-      } else if (dataSource === 'excel') {
-        // Excel only - use Excel query endpoint
-        const response = await queryExcel(content.trim());
-        answer = response.answer;
-        if (response.chartData) {
-          chartData = response.chartData;
+
+        const reader = fetchResponse.body?.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let streamBuffer = '';
+
+        if (!reader) {
+          throw new Error("Failed to initialize stream reader");
         }
-      } else if (dataSource === 'pdf' || dataSource === 'both') {
-        // PDF/DOCX/PPTX available - use RAG query endpoint
-        const response = await queryDocuments(content.trim());
-        answer = response.answer;
-        sources = response.sourceDocuments;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          streamBuffer += decoder.decode(value, { stream: true });
+          const lines = streamBuffer.split('\n\n');
+          streamBuffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const cleanLine = line.trim();
+            if (cleanLine.startsWith('data: ')) {
+              const dataStr = cleanLine.slice(6);
+              if (dataStr === '[DONE]') continue;
+
+              let parseError: Error | null = null;
+              try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.type === 'metadata') {
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === assistantMessageId
+                        ? { ...msg, sources: parsed.sourceDocuments }
+                        : msg
+                    )
+                  );
+                } else if (parsed.type === 'content') {
+                  answer += parsed.text;
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === assistantMessageId
+                        ? { ...msg, content: answer }
+                        : msg
+                    )
+                  );
+                } else if (parsed.type === 'error') {
+                  parseError = new Error(parsed.message);
+                }
+              } catch (e) {
+                console.error("Failed to parse stream chunk:", e);
+              }
+              if (parseError) {
+                throw parseError;
+              }
+            }
+          }
+        }
+        recordQueryTelemetry(Date.now() - startTime);
       } else {
         throw new Error("No data source available");
       }
-
-      const assistantMessage: ChatMessage = {
-        id: generateId(),
-        content: answer,
-        role: "assistant",
-        timestamp: new Date(),
-        sources: sources.length > 0 ? sources : undefined,
-        chartData,
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Chat error:", error);
-      const errorMessage: ChatMessage = {
-        id: generateId(),
-        content:
-          "Sorry, I encountered an error processing your request. Please try again.",
-        role: "assistant",
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
+      
+      setMessages((prev) => {
+        // If we added a placeholder message, replace its content with the error description
+        const hasPlaceholder = prev.some(m => m.id === assistantMessageId);
+        if (hasPlaceholder) {
+          return prev.map(m => 
+            m.id === assistantMessageId 
+              ? { ...m, content: "Sorry, I encountered an error processing your request. Please try again." } 
+              : m
+          );
+        } else {
+          // Otherwise, append a new error message
+          const errorMessage: ChatMessage = {
+            id: generateId(),
+            content: "Sorry, I encountered an error processing your request. Please try again.",
+            role: "assistant",
+            timestamp: new Date(),
+          };
+          return [...prev, errorMessage];
+        }
+      });
+
       toast.error("Query failed", {
-        description:
-          "There was an error processing your question. Please try again.",
+        description: error.message || "There was an error processing your question. Please try again.",
       });
     } finally {
       setIsLoading(false);
@@ -262,6 +400,7 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
+    if (isLoading || !inputValue.trim()) return;
     sendMessage(inputValue);
   };
 
@@ -334,6 +473,87 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
             </div>
 
             <div className="flex items-center gap-2">
+              {/* Query Scope Selector */}
+              {uploadedDocuments.length > 0 && (
+                <div className="relative">
+                  <Button 
+                    variant="outline" 
+                    size="sm" 
+                    onClick={() => setShowScopeSelector(prev => !prev)} 
+                    className="gap-2 shadow-sm text-muted-foreground mr-1 h-8 shrink-0 font-medium"
+                  >
+                    <FileText className="w-4 h-4 text-indigo-600" />
+                    <span className="text-xs">
+                      {selectedDocumentIds.length === 0 
+                        ? 'Scope: Entire Library' 
+                        : `Scope: ${selectedDocumentIds.length} ${selectedDocumentIds.length === 1 ? 'File' : 'Files'}`}
+                    </span>
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  </Button>
+
+                  {showScopeSelector && (
+                    <>
+                      {/* Click outside overlay */}
+                      <div className="fixed inset-0 z-40" onClick={() => setShowScopeSelector(false)}></div>
+                      
+                      <div className="absolute right-0 mt-1.5 w-72 bg-white border border-slate-200 rounded-xl shadow-xl z-50 p-3 max-h-80 flex flex-col">
+                        <div className="flex items-center justify-between pb-2 border-b border-slate-100 mb-2 flex-shrink-0">
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Query Scope</span>
+                          {selectedDocumentIds.length > 0 && (
+                            <button 
+                              onClick={() => {
+                                // Clear all selections to reset to all
+                                selectedDocumentIds.forEach(id => onToggleSelect?.(id));
+                              }}
+                              className="text-[10px] font-semibold text-indigo-600 hover:text-indigo-500 bg-transparent border-0 cursor-pointer"
+                            >
+                              Reset to All
+                            </button>
+                          )}
+                        </div>
+                        <ScrollArea className="flex-grow overflow-y-auto max-h-[180px]">
+                          <div className="space-y-1.5 pr-2">
+                            <label className="flex items-center gap-2.5 p-1.5 rounded-lg hover:bg-slate-50 cursor-pointer text-xs font-medium w-full select-none">
+                              <input 
+                                type="checkbox"
+                                checked={selectedDocumentIds.length === 0}
+                                onChange={() => {
+                                  // If there are selections, clear them to make it Entire Library
+                                  if (selectedDocumentIds.length > 0) {
+                                    selectedDocumentIds.forEach(id => onToggleSelect?.(id));
+                                  }
+                                }}
+                                className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 h-3.5 w-3.5 accent-indigo-600"
+                              />
+                              <span className={cn(selectedDocumentIds.length === 0 ? "font-bold text-indigo-600" : "text-slate-600")}>
+                                Entire Library ({uploadedDocuments.length} files)
+                              </span>
+                            </label>
+                            <div className="border-t border-slate-100 my-1"></div>
+                            {uploadedDocuments.map((doc) => {
+                              const isChecked = selectedDocumentIds.includes(doc.id);
+                              return (
+                                <label key={doc.id} className="flex items-center gap-2.5 p-1.5 rounded-lg hover:bg-slate-50 cursor-pointer text-xs w-full select-none">
+                                  <input 
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => onToggleSelect?.(doc.id)}
+                                    className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 h-3.5 w-3.5 accent-indigo-600"
+                                  />
+                                  <span className={cn("truncate flex-1 text-left", isChecked ? "font-semibold text-slate-900" : "text-slate-500")}>
+                                    {doc.originalFileName}
+                                  </span>
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </ScrollArea>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
               <Button variant="ghost" size="sm" onClick={createNewSession} className="gap-1 px-2 h-8 shrink-0">
                 <Plus className="w-4 h-4" /> <span className="hidden sm:inline">New</span>
               </Button>
@@ -366,7 +586,8 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
                         key={index}
                         variant="outline"
                         size="sm"
-                        className="bg-background hover:bg-muted text-muted-foreground hover:text-foreground border-input"
+                        disabled={isLoading}
+                        className="bg-background hover:bg-muted text-muted-foreground hover:text-foreground border-input disabled:opacity-50"
                         onClick={() => selectSuggestion(suggestion)}
                       >
                         {suggestion}
@@ -377,10 +598,21 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
               </div>
             ) : (
               <div className="space-y-6 w-full max-w-full overflow-hidden pb-4">
-                {messages.map((message) => (
-                  <div
-                    key={message.id}
-                    className={cn(
+                {messages.map((message) => {
+                  // Skip rendering placeholder assistant message while it has no content, chart, or sources
+                  if (
+                    message.role === "assistant" &&
+                    !message.content.trim() &&
+                    !message.chartData &&
+                    (!message.sources || message.sources.length === 0)
+                  ) {
+                    return null;
+                  }
+
+                  return (
+                    <div
+                      key={message.id}
+                      className={cn(
                       "flex gap-4 min-w-0",
                       message.role === "user" ? "justify-end" : "justify-start"
                     )}
@@ -400,7 +632,12 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
                           : "bg-muted/50 text-foreground border border-border/50 rounded-tl-sm"
                       )}
                     >
-                      <div className="text-sm prose prose-sm max-w-none break-words overflow-wrap-anywhere prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-headings:my-2 prose-strong:font-semibold">
+                      <div
+                        className={cn(
+                          "text-sm prose prose-sm max-w-none break-words overflow-wrap-anywhere prose-p:my-1 prose-ul:my-1 prose-ol:my-1 prose-li:my-0.5 prose-headings:my-2 prose-strong:font-semibold",
+                          message.role === "user" ? "prose-invert text-white" : "text-foreground"
+                        )}
+                      >
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
                           {message.content}
                         </ReactMarkdown>
@@ -462,13 +699,14 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
                               {message.sources.map((source, index) => (
                                 <div
                                   key={index}
-                                  className="bg-background/50 rounded p-2 text-xs overflow-hidden border border-border/10"
+                                  className="bg-background/50 rounded p-2 text-xs overflow-hidden border border-border/10 cursor-pointer hover:bg-background/80 transition"
+                                  onClick={() => onSourceClick?.(source)}
                                 >
                                   <div className="flex items-center justify-between mb-1 gap-2">
                                     <span className="font-medium truncate min-w-0 flex-1">
                                       {source.metadata.source}
-                                      {source.metadata.chunkIndex !== undefined &&
-                                        ` - Chunk ${source.metadata.chunkIndex}`}
+                                      {source.metadata.pageNumber !== undefined &&
+                                        ` - Page ${source.metadata.pageNumber}`}
                                     </span>
                                   </div>
                                   <p className="opacity-80 line-clamp-3 break-words">
@@ -489,10 +727,10 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
                       </div>
                     )}
                   </div>
-                ))}
+                )})}
 
                 {/* Loading indicator */}
-                {isLoading && (
+                {isLoading && (!messages.length || messages[messages.length - 1].role !== "assistant" || !messages[messages.length - 1].content.trim()) && (
                   <div className="flex gap-4 justify-start">
                     <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center border border-primary/20">
                       <Bot className="w-4 h-4 text-primary" />
@@ -526,7 +764,10 @@ export const Chat = ({ documentsReady = false, dataSource = 'none' }: ChatProps)
                     : "Upload a document first..."
                 }
                 disabled={!documentsReady || isLoading}
-                className="flex-1 bg-muted/30 border-input text-foreground placeholder:text-muted-foreground focus-visible:ring-primary shadow-sm"
+                className={cn(
+                  "flex-1 bg-muted/30 border-input text-foreground placeholder:text-muted-foreground focus-visible:ring-primary shadow-sm",
+                  isLoading && "opacity-60 cursor-not-allowed bg-slate-100"
+                )}
               />
               <Button
                 type="submit"

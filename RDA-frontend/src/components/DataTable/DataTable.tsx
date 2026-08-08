@@ -36,11 +36,15 @@ export const DataTable = ({ data, columns, totalRows, fileName }: DataTableProps
   const [sorting, setSorting] = useState<SortingState>([]);
   const [globalFilter, setGlobalFilter] = useState('');
 
+  const safeColumns = useMemo(() => (columns || []).filter(Boolean), [columns]);
+  const safeData = useMemo(() => (data || []).filter(Boolean), [data]);
+
   // Create column definitions for TanStack Table
   const tableColumns = useMemo<ColumnDef<Record<string, unknown>>[]>(
     () =>
-      columns.map((col) => ({
-        accessorKey: col.key,
+      safeColumns.map((col, index) => ({
+        id: col?.key || `col-${index}`,
+        accessorKey: col?.key || '',
         header: ({ column }) => {
           const isSorted = column.getIsSorted();
           return (
@@ -76,11 +80,11 @@ export const DataTable = ({ data, columns, totalRows, fileName }: DataTableProps
           return <span className="truncate max-w-[200px] block">{String(value)}</span>;
         },
       })),
-    [columns]
+    [safeColumns]
   );
 
   const table = useReactTable({
-    data,
+    data: safeData,
     columns: tableColumns,
     state: {
       sorting,
@@ -111,7 +115,7 @@ export const DataTable = ({ data, columns, totalRows, fileName }: DataTableProps
               {totalRows.toLocaleString()} rows
             </Badge>
             <Badge variant="secondary" className="bg-gray-700 text-gray-300">
-              {columns.length} columns
+              {safeColumns.length} columns
             </Badge>
           </div>
           <div className="relative w-64">
@@ -174,7 +178,7 @@ export const DataTable = ({ data, columns, totalRows, fileName }: DataTableProps
                 ) : (
                   <tr>
                     <td
-                      colSpan={columns.length}
+                      colSpan={safeColumns.length}
                       className="px-3 py-8 text-center text-gray-500"
                     >
                       No data found

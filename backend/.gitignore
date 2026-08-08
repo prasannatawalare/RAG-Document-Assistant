@@ -64,3 +64,12 @@ coverage/
 # Temporary folders
 tmp/
 temp/
+/src/generated/prisma
+
+# SQLite Database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+dev.db
+

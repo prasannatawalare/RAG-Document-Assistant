@@ -1,0 +1,65 @@
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String        @id @default(uuid())
+  email     String        @unique
+  password  String
+  documents Document[]
+  sessions  ChatSession[]
+  agents    Agent[]
+  createdAt DateTime      @default(now())
+}
+
+model Document {
+  id               String   @id @default(uuid())
+  fileName         String
+  originalFileName String
+  filePath         String
+  fileType         String
+  size             Int
+  chunksCount      Int
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt        DateTime @default(now())
+}
+
+model ChatSession {
+  id        String        @id @default(uuid())
+  title     String
+  userId    String
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  ChatMessage[]
+  agentId   String?
+  agent     Agent?        @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+}
+
+model ChatMessage {
+  id        String      @id @default(uuid())
+  sessionId String
+  session   ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role      String      // 'user' | 'assistant'
+  content   String
+  metadata  String?     // JSON string for sources, chartData
+  createdAt DateTime    @default(now())
+}
+
+model Agent {
+  id           String        @id @default(uuid())
+  name         String
+  description  String
+  systemPrompt String
+  temperature  Float         @default(0.7)
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions     ChatSession[]
+  createdAt    DateTime      @default(now())
+}

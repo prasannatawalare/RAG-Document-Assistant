@@ -1,21 +1,32 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { MemoryVectorStore } from 'langchain/vectorstores/memory';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
+import MiniSearch from 'minisearch';
+import { pipeline } from '@huggingface/transformers';
 
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { AppError } from '../middleware/errorHandler.js';
+import prisma from '../db.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 class RAGService {
   constructor() {
-    this.vectorStore = null;
-    this.retriever = null;
-    this.documents = [];
     this.rateLimitCooldownUntil = null;
 
-    // Initialize Gemini
+    // Cache active user stores in-memory to avoid reading disk on every request
+    // Key: userId, Value: { vectorStore, miniSearch, docsCount }
+    this.userStores = new Map();
+
+    // Initialize Gemini API
     this.genAI = new GoogleGenerativeAI(config.geminiApiKey);
     this.model = this.genAI.getGenerativeModel({
       model: 'gemini-2.5-flash-lite',
@@ -30,7 +41,7 @@ class RAGService {
     // Initialize embeddings
     this.embeddings = new GoogleGenerativeAIEmbeddings({
       apiKey: config.geminiApiKey,
-      model: 'gemini-embedding-001', // Using newer embedding model
+      model: 'gemini-embedding-001',
     });
 
     this.textSplitter = new RecursiveCharacterTextSplitter({
@@ -38,24 +49,114 @@ class RAGService {
       chunkOverlap: config.chunkOverlap,
     });
 
-    logger.info('RAG Service initialized with Gemini AI');
+    // Lazy load the local cross-encoder reranker
+    this.rerankerPromise = null;
+
+    logger.info('RAG Service initialized');
+  }
+
+  // Load the local reranker pipeline
+  async _getReranker() {
+    if (!this.rerankerPromise) {
+      logger.info('Loading local Cross-Encoder reranker model (ms-marco-MiniLM-L-6-v2)...');
+      this.rerankerPromise = pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2');
+    }
+    return this.rerankerPromise;
+  }
+
+  // Get index paths for a specific user
+  _getUserIndexPaths(userId) {
+    const userDir = path.join(__dirname, '../../uploads/indices', userId);
+    if (!fs.existsSync(userDir)) {
+      fs.mkdirSync(userDir, { recursive: true });
+    }
+    return {
+      userDir,
+      vectorsPath: path.join(userDir, 'vectors.json'),
+      minisearchPath: path.join(userDir, 'minisearch.json'),
+    };
+  }
+
+  // Retrieve or load user store
+  async _getUserStore(userId) {
+    if (this.userStores.has(userId)) {
+      return this.userStores.get(userId);
+    }
+
+    const { vectorsPath, minisearchPath } = this._getUserIndexPaths(userId);
+
+    const store = {
+      vectorStore: new MemoryVectorStore(this.embeddings),
+      miniSearch: new MiniSearch({
+        fields: ['text'],
+        storeFields: ['id', 'text', 'metadata', 'source'],
+        searchOptions: {
+          boost: { text: 1 },
+          fuzzy: 0.2
+        }
+      }),
+      docsCount: 0
+    };
+
+    // Load persisted vector store if it exists
+    if (fs.existsSync(vectorsPath)) {
+      try {
+        const vectorsJson = fs.readFileSync(vectorsPath, 'utf8');
+        store.vectorStore.memoryVectors = JSON.parse(vectorsJson);
+        store.docsCount = store.vectorStore.memoryVectors.length;
+        logger.info(`Loaded persistent vector store for user ${userId} (${store.docsCount} chunks)`);
+      } catch (err) {
+        logger.error(`Failed to load persistent vectors for user ${userId}:`, err);
+      }
+    }
+
+    // Load persisted MiniSearch index if it exists
+    if (fs.existsSync(minisearchPath)) {
+      try {
+        const miniSearchJson = fs.readFileSync(minisearchPath, 'utf8');
+        store.miniSearch = MiniSearch.loadJSON(miniSearchJson, {
+          fields: ['text'],
+          storeFields: ['id', 'text', 'metadata', 'source']
+        });
+        logger.info(`Loaded persistent MiniSearch index for user ${userId}`);
+      } catch (err) {
+        logger.error(`Failed to load persistent MiniSearch for user ${userId}:`, err);
+      }
+    }
+
+    this.userStores.set(userId, store);
+    return store;
+  }
+
+  // Persist user store back to disk
+  async _persistUserStore(userId, store) {
+    const { vectorsPath, minisearchPath } = this._getUserIndexPaths(userId);
+
+    try {
+      const vectorsJson = JSON.stringify(store.vectorStore.memoryVectors);
+      fs.writeFileSync(vectorsPath, vectorsJson, 'utf8');
+
+      const miniSearchJson = JSON.stringify(store.miniSearch.toJSON());
+      fs.writeFileSync(minisearchPath, miniSearchJson, 'utf8');
+
+      logger.info(`Persisted RAG index for user ${userId} to disk`);
+    } catch (err) {
+      logger.error(`Failed to persist RAG index for user ${userId}:`, err);
+      throw new AppError('Failed to persist index files on local disk.', 500);
+    }
   }
 
   // Helper to process documents in batches with delays (avoids rate limits)
-  async createVectorStoreWithBatching(docs) {
+  async createVectorStoreWithBatching(docs, store) {
     const batchSize = config.embeddingBatchSize || 3;
     const delayMs = config.embeddingDelayMs || 2000;
 
     logger.info(`Processing ${docs.length} chunks in batches of ${batchSize} with ${delayMs}ms delay`);
 
-    // Create vector store with first batch
+    // Create / add first batch
     const firstBatch = docs.slice(0, batchSize);
     logger.info(`Processing batch 1: chunks 0-${firstBatch.length - 1}`);
-
-    const vectorStore = await MemoryVectorStore.fromDocuments(
-      firstBatch,
-      this.embeddings
-    );
+    await store.vectorStore.addDocuments(firstBatch);
 
     // Add remaining batches with delays
     for (let i = batchSize; i < docs.length; i += batchSize) {
@@ -66,16 +167,16 @@ class RAGService {
       await new Promise(resolve => setTimeout(resolve, delayMs));
 
       logger.info(`Processing batch ${batchNum + 1}: chunks ${i}-${i + batch.length - 1}`);
-      await vectorStore.addDocuments(batch);
+      await store.vectorStore.addDocuments(batch);
     }
-
-    return vectorStore;
   }
 
   async processDocument(filePath, options = {}) {
     try {
-      const { mode = 'replace' } = options; // 'replace' or 'append'
-      logger.info(`Processing document: ${filePath} (mode: ${mode})`);
+      const { mode = 'replace', userId } = options;
+      if (!userId) throw new AppError('userId is required to process document', 400);
+
+      logger.info(`Processing document: ${filePath} (mode: ${mode}) for user: ${userId}`);
 
       const now = Date.now();
       if (config.rateLimitCooldownMs && this.rateLimitCooldownUntil && now < this.rateLimitCooldownUntil) {
@@ -94,35 +195,22 @@ class RAGService {
         throw new AppError('Failed to extract content from PDF. The file might be a scanned image or encrypted.', 400);
       }
 
-      // Add source metadata to identify the document
-      // Handle both Windows and Unix path separators
-      let fullFileName;
-      if (filePath.includes('\\')) {
-        fullFileName = filePath.split('\\').pop();
-      } else if (filePath.includes('/')) {
-        fullFileName = filePath.split('/').pop();
-      } else {
-        fullFileName = filePath;
-      }
-
-      // Remove timestamp prefix (e.g., "1758724334844-654713938-" from filename)
+      // Extract filename
+      let fullFileName = filePath.split(path.sep).pop() || filePath;
       const cleanFileName = fullFileName.replace(/^\d+-\d+-/, '');
 
-      logger.info(`Original path: "${filePath}"`);
-      logger.info(`Full filename: "${fullFileName}"`);
-      logger.info(`Clean filename: "${cleanFileName}"`);
-
-      docs.forEach(doc => {
+      docs.forEach((doc, idx) => {
         doc.metadata = {
           ...doc.metadata,
           source: cleanFileName,
           originalFileName: fullFileName,
           filePath: filePath,
+          pageNumber: (doc.metadata.loc?.pageNumber || doc.metadata.pdf?.info?.Pages || idx + 1),
           uploadedAt: new Date().toISOString()
         };
       });
 
-      return this._processDocsInternal(docs, cleanFileName, fullFileName, filePath, mode);
+      return this._processDocsInternal(docs, cleanFileName, fullFileName, filePath, mode, userId);
     } catch (error) {
       logger.error('Error processing document:', error);
 
@@ -138,15 +226,12 @@ class RAGService {
     }
   }
 
-  /**
-   * Process pre-extracted text documents (from DOCX, PPTX, etc.)
-   * Takes raw LangChain-compatible document objects and runs them through
-   * the same chunking/embedding pipeline as PDFs.
-   */
   async processRawText(extractedDocs, options = {}) {
     try {
-      const { mode = 'replace', cleanFileName, fullFileName, filePath } = options;
-      logger.info(`Processing raw text document: ${cleanFileName} (mode: ${mode})`);
+      const { mode = 'replace', cleanFileName, fullFileName, filePath, userId } = options;
+      if (!userId) throw new AppError('userId is required to process raw text', 400);
+
+      logger.info(`Processing raw text document: ${cleanFileName} (mode: ${mode}) for user: ${userId}`);
 
       const now = Date.now();
       if (config.rateLimitCooldownMs && this.rateLimitCooldownUntil && now < this.rateLimitCooldownUntil) {
@@ -161,7 +246,7 @@ class RAGService {
         throw new AppError('No text content extracted from document', 400);
       }
 
-      return this._processDocsInternal(extractedDocs, cleanFileName, fullFileName, filePath, mode);
+      return this._processDocsInternal(extractedDocs, cleanFileName, fullFileName, filePath, mode, userId);
     } catch (error) {
       logger.error('Error processing raw text document:', error);
 
@@ -177,11 +262,9 @@ class RAGService {
     }
   }
 
-  /**
-   * Internal method that handles chunking, embedding, and vector store operations
-   * Used by both processDocument (PDF) and processRawText (DOCX/PPTX)
-   */
-  async _processDocsInternal(docs, cleanFileName, fullFileName, filePath, mode) {
+  async _processDocsInternal(docs, cleanFileName, fullFileName, filePath, mode, userId) {
+    const store = await this._getUserStore(userId);
+
     // Split the documents into chunks
     const splitDocs = await this.textSplitter.splitDocuments(docs);
 
@@ -193,165 +276,469 @@ class RAGService {
         originalFileName: fullFileName,
         filePath: filePath,
         chunkIndex: index,
+        pageNumber: chunk.metadata.pageNumber || 1,
         uploadedAt: new Date().toISOString()
       };
     });
 
     logger.info(`Document "${cleanFileName}" split into ${splitDocs.length} chunks`);
 
-    const maxChunks = config.maxChunksPerDocument;
-    let limitedSplitDocs = splitDocs;
-    if (maxChunks && splitDocs.length > maxChunks) {
-      logger.warn(`Document "${cleanFileName}" has ${splitDocs.length} chunks, limiting to first ${maxChunks} chunks to stay within free-tier limits`);
-      limitedSplitDocs = splitDocs.slice(0, maxChunks);
+    if (mode === 'replace') {
+      logger.info(`REPLACE MODE: Clearing index and database records for user ${userId}`);
+      store.vectorStore = new MemoryVectorStore(this.embeddings);
+      store.miniSearch = new MiniSearch({
+        fields: ['text'],
+        storeFields: ['id', 'text', 'metadata', 'source'],
+        searchOptions: { boost: { text: 1 }, fuzzy: 0.2 }
+      });
+      // Delete user documents in DB
+      await prisma.document.deleteMany({
+        where: { userId }
+      });
     }
 
-    // Handle different modes - use batched processing to avoid rate limits
-    if (mode === 'replace') {
-      // REPLACE MODE: Clear existing documents and create new vector store
-      logger.info('REPLACE MODE: Clearing existing documents and creating new vector store');
-      this.vectorStore = await this.createVectorStoreWithBatching(limitedSplitDocs);
-      this.documents = []; // Clear document tracking
-    } else if (mode === 'append') {
-      // APPEND MODE: Add to existing vector store
-      if (!this.vectorStore) {
-        logger.info('APPEND MODE: Creating new vector store (no existing store)');
-        this.vectorStore = await this.createVectorStoreWithBatching(limitedSplitDocs);
-      } else {
-        logger.info(`APPEND MODE: Adding ${limitedSplitDocs.length} chunks to existing vector store`);
-        // Add in batches for append mode too
-        const batchSize = config.embeddingBatchSize || 3;
-        const delayMs = config.embeddingDelayMs || 2000;
-        for (let i = 0; i < limitedSplitDocs.length; i += batchSize) {
-          if (i > 0) {
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-          }
-          const batch = limitedSplitDocs.slice(i, i + batchSize);
-          await this.vectorStore.addDocuments(batch);
-        }
+    // Embed documents locally using batch runner
+    await this.createVectorStoreWithBatching(splitDocs, store);
+
+    // Index documents in MiniSearch for keyword lookup
+    const searchDocs = splitDocs.map((chunk, idx) => ({
+      id: `${cleanFileName}_${idx}_${Date.now()}`,
+      text: chunk.pageContent,
+      metadata: chunk.metadata,
+      source: cleanFileName
+    }));
+    await store.miniSearch.addAll(searchDocs);
+
+    // Save index files locally on disk
+    await this._persistUserStore(userId, store);
+
+    // Record document in SQLite database (avoid creating duplicate record if already created by CSV/Excel processors)
+    const fileStats = fs.existsSync(filePath) ? fs.statSync(filePath) : { size: docs[0]?.pageContent?.length || 0 };
+    const ext = path.extname(cleanFileName).replace('.', '') || 'txt';
+    
+    const existingDoc = await prisma.document.findFirst({
+      where: {
+        filePath,
+        userId
       }
-    }
+    });
 
-    // Update retriever
-    if (mode === 'replace') {
-      // For single document, use fewer chunks for more focused results
-      this.retriever = this.vectorStore.asRetriever({
-        k: 5,
-        searchType: 'similarity',
-        searchKwargs: {
-          fetchK: 10
+    if (existingDoc) {
+      await prisma.document.update({
+        where: { id: existingDoc.id },
+        data: {
+          chunksCount: splitDocs.length
         }
       });
     } else {
-      // For multi-document, use more chunks for broader coverage
-      this.retriever = this.vectorStore.asRetriever({
-        k: 8,
-        searchType: 'similarity',
-        searchKwargs: {
-          fetchK: 20
+      await prisma.document.create({
+        data: {
+          fileName: cleanFileName,
+          originalFileName: fullFileName,
+          filePath,
+          fileType: ext,
+          size: fileStats.size,
+          chunksCount: splitDocs.length,
+          userId
         }
       });
     }
 
-    // Track document
-    this.documents.push({
-      fileName: cleanFileName,
-      originalFileName: fullFileName,
-      filePath,
-      chunksCount: limitedSplitDocs.length,
-      uploadedAt: new Date().toISOString(),
-      mode: mode
-    });
-
-    const totalDocs = this.documents.length;
-    const totalChunks = this.documents.reduce((sum, doc) => sum + doc.chunksCount, 0);
-
-    const modeMessage = mode === 'replace'
-      ? `Document "${cleanFileName}" processed (REPLACED previous documents)`
-      : `Document "${cleanFileName}" processed (ADDED to existing documents)`;
-
-    logger.info(`${modeMessage}. Total documents: ${totalDocs}, Total chunks: ${totalChunks}`);
+    const userDocs = await prisma.document.findMany({ where: { userId } });
+    const totalDocs = userDocs.length;
+    const totalChunks = userDocs.reduce((sum, doc) => sum + doc.chunksCount, 0);
 
     return {
       success: true,
-      chunksCount: limitedSplitDocs.length,
+      chunksCount: splitDocs.length,
       fileName: cleanFileName,
       originalFileName: fullFileName,
       totalDocuments: totalDocs,
       totalChunks: totalChunks,
       mode: mode,
-      message: `${modeMessage}. Total: ${totalDocs} documents with ${totalChunks} chunks.`,
-      waitBeforeQuery: true, // Signal to frontend to wait
-      waitTimeMs: 5000 // Suggested wait time
+      message: `Document processed successfully. Total: ${totalDocs} docs, ${totalChunks} chunks.`,
+      waitBeforeQuery: true,
+      waitTimeMs: 2000
     };
   }
 
-  async query(question) {
+  _isBoilerplateChunk(text) {
+    if (!text) return false;
+    const lower = text.toLowerCase();
+    
+    const boilerplatePatterns = [
+      /this is to certify that/i,
+      /project approval sheet/i,
+      /declaration by the candidate/i,
+      /acknowledgements?/i,
+      /table of contents/i,
+      /list of figures/i,
+      /list of tables/i,
+      /partial fulfillment of the/i,
+      /submitted to the/i,
+      /under the guidance of/i,
+      /bachelor of engineering/i,
+      /master of technology/i,
+      /doctor of philosophy/i
+    ];
+    
+    return boilerplatePatterns.some(pattern => pattern.test(lower));
+  }
+
+  async _condenseQuestion(question, history) {
+    if (!history || history.length === 0) {
+      return question;
+    }
+
     try {
-      if (!this.retriever) {
-        throw new AppError('No documents have been processed yet', 400);
-      }
+      const historyText = history.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join("\n");
+      
+      const prompt = `
+Given the following conversation history and a follow-up question from the user, rephrase the follow-up question into a standalone, search-optimized query.
+The standalone query should contain all necessary context (nouns, references, pronouns resolved) from the history so it can be searched in a document index.
+Do not output any introductory or concluding text, only output the standalone rephrased query.
 
-      const now = Date.now();
-      if (config.rateLimitCooldownMs && this.rateLimitCooldownUntil && now < this.rateLimitCooldownUntil) {
-        const secondsRemaining = Math.ceil((this.rateLimitCooldownUntil - now) / 1000);
-        throw new AppError(
-          `Gemini API rate limit hit recently. Please wait ${secondsRemaining} seconds before asking another question.`,
-          429
-        );
-      }
+Conversation History:
+${historyText}
 
-      logger.info(`Processing query: "${question}" across ${this.documents.length} documents`);
+Follow-up Question: ${question}
 
-      // Retrieve relevant documents with rate limit handling
-      let relevantDocs;
-      try {
-        relevantDocs = await this.retriever.getRelevantDocuments(question);
-      } catch (embedError) {
-        if (embedError.message && embedError.message.includes('429')) {
-          logger.error('Rate limit hit on embeddings API');
-          const cooldownMs = config.rateLimitCooldownMs || 60000;
-          this.rateLimitCooldownUntil = Date.now() + cooldownMs;
-          const seconds = Math.ceil(cooldownMs / 1000);
-          throw new AppError(`Gemini API rate limit exceeded. Please wait ${seconds} seconds before trying again.`, 429);
-        }
-        throw embedError;
-      }
+Standalone Query:`;
 
-      logger.info(`Retrieved ${relevantDocs.length} relevant chunks from vector store`);
-
-      // Group documents by source for better context organization
-      const docsBySource = relevantDocs.reduce((acc, doc) => {
-        const source = doc.metadata?.source || 'unknown';
-        if (!acc[source]) {
-          acc[source] = [];
-        }
-        acc[source].push(doc);
-        return acc;
-      }, {});
-
-      // Log sources being used
-      const sources = Object.keys(docsBySource);
-      logger.info(`Using content from documents: ${sources.join(', ')}`);
-
-      // Prepare context with source attribution
-      const contextParts = Object.entries(docsBySource).map(([source, docs]) => {
-        const content = docs.map(doc => doc.pageContent).join('\n');
-        return `=== From document: ${source} ===\n${content}`;
+      const result = await this.model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.2 }
       });
 
-      const context = contextParts.join('\n\n');
+      const rephrased = result.response.text().trim();
+      logger.info(`Rephrased user query: "${question}" -> "${rephrased}"`);
+      return rephrased || question;
+    } catch (err) {
+      logger.error('Failed to condense question, using original query:', err);
+      return question;
+    }
+  }
 
-      // Enhanced prompt for multi-document awareness
-      const prompt = `
-You are a helpful AI assistant that answers questions based on multiple documents.
+  async _prepareContextAndPrompt(question, history = [], userId, selectedDocumentIds = null, agentId = null, retrievalOptions = {}) {
+    const searchQuestion = await this._condenseQuestion(question, history);
+    const store = await this._getUserStore(userId);
+    const topK = retrievalOptions.topK || 6;
+    const isHybrid = retrievalOptions.retrievalMode !== 'vector';
+    const isReranking = retrievalOptions.useReranking !== false;
+
+    // Resolve retrieve limit. If reranking is enabled, we fetch more candidates first, then filter down to topK.
+    const retrieveLimit = isReranking ? Math.max(15, topK + 5) : topK;
+
+    // Resolve selected document IDs to their filenames
+    let selectedFileNames = null;
+    if (selectedDocumentIds && selectedDocumentIds.length > 0) {
+      const selectedDocs = await prisma.document.findMany({
+        where: {
+          id: { in: selectedDocumentIds },
+          userId
+        },
+        select: { fileName: true }
+      });
+      selectedFileNames = selectedDocs.map(d => d.fileName);
+      logger.info(`Scoping query to selected files: ${selectedFileNames.join(', ')}`);
+    }
+
+    const userDocs = await prisma.document.findMany({ where: { userId } });
+    const validFileNames = userDocs.map(d => d.fileName);
+
+    if (userDocs.length === 0 || store.vectorStore.memoryVectors.length === 0) {
+      throw new AppError('No documents have been uploaded or processed yet.', 400);
+    }
+
+    // Determine the active scope of filenames (either the selected files or all user files)
+    const activeFileNames = selectedFileNames && selectedFileNames.length > 0
+      ? selectedFileNames
+      : validFileNames;
+
+    // Detect if this is a global query asking for summaries/overviews/key points/comparisons (expanded to catch singular and findings queries)
+    const isGlobalQuery = /summariz|summary|key points|overview|compare|comparison|difference|similarit|what is (this|the) (document|file) about|about the (document|file)|main findings|what are (these|the) documents|about the documents|list of documents|all documents/i.test(searchQuestion);
+
+    // 1. Semantic Vector Search
+    let vectorDocs = [];
+    try {
+      if (isGlobalQuery && activeFileNames.length > 1) {
+        // Multi-document summary query: retrieve top chunks per active document
+        for (const fileName of activeFileNames) {
+          const docVectors = store.vectorStore.memoryVectors.filter(mv => 
+            mv.metadata?.source === fileName && !this._isBoilerplateChunk(mv.pageContent || mv.content)
+          );
+          if (docVectors.length > 0) {
+            const docStore = new MemoryVectorStore(this.embeddings);
+            docStore.memoryVectors = docVectors;
+            const results = await docStore.similaritySearch(searchQuestion, 3);
+            vectorDocs.push(...results.map(doc => ({
+              pageContent: doc.pageContent,
+              metadata: doc.metadata,
+              score: 1.0
+            })));
+          }
+        }
+      } else if (isGlobalQuery && activeFileNames.length === 1) {
+        // Single document summary query: retrieve structural chunks (first 3 + last 1) + top semantic matches
+        const fileName = activeFileNames[0];
+        const docVectors = store.vectorStore.memoryVectors.filter(mv => 
+          mv.metadata?.source === fileName && !this._isBoilerplateChunk(mv.pageContent || mv.content)
+        );
+
+        if (docVectors.length > 0) {
+          // Sort by chunkIndex ascending
+          const sortedVectors = [...docVectors].sort((a, b) => 
+            (a.metadata?.chunkIndex || 0) - (b.metadata?.chunkIndex || 0)
+          );
+
+          const firstChunks = sortedVectors.slice(0, 3);
+          const lastChunk = sortedVectors.length > 3 ? [sortedVectors[sortedVectors.length - 1]] : [];
+
+          // Retrieve relevant chunks within this specific document
+          const docStore = new MemoryVectorStore(this.embeddings);
+          docStore.memoryVectors = docVectors;
+          const simResults = await docStore.similaritySearch(searchQuestion, 3);
+
+          const uniqueMap = new Map();
+          [...firstChunks, ...simResults, ...lastChunk].forEach(mv => {
+            const key = `${mv.metadata?.source || fileName}_${mv.metadata?.chunkIndex || 0}`;
+            uniqueMap.set(key, {
+              pageContent: mv.pageContent || mv.content || '',
+              metadata: mv.metadata
+            });
+          });
+
+          vectorDocs = Array.from(uniqueMap.values()).map(doc => ({
+            pageContent: doc.pageContent,
+            metadata: doc.metadata,
+            score: 1.0
+          }));
+        }
+      } else {
+        // Standard single/merged query: filter memory vectors to active scope (ignoring boilerplate chunks)
+        const filteredStore = new MemoryVectorStore(this.embeddings);
+        filteredStore.memoryVectors = store.vectorStore.memoryVectors.filter(mv => 
+          activeFileNames.includes(mv.metadata?.source) && !this._isBoilerplateChunk(mv.pageContent || mv.content)
+        );
+        if (filteredStore.memoryVectors.length > 0) {
+          const results = await filteredStore.similaritySearch(searchQuestion, retrieveLimit);
+          vectorDocs = results.map(doc => ({
+            pageContent: doc.pageContent,
+            metadata: doc.metadata,
+            score: 1.0
+          }));
+        }
+      }
+    } catch (embedError) {
+      if (embedError.message && (embedError.message.includes('429') || embedError.message.includes('quota'))) {
+        const cooldownMs = config.rateLimitCooldownMs || 60000;
+        this.rateLimitCooldownUntil = Date.now() + cooldownMs;
+        const seconds = Math.ceil(cooldownMs / 1000);
+        throw new AppError(`Gemini API rate limit exceeded. Please wait ${seconds} seconds before trying again.`, 429);
+      }
+      throw embedError;
+    }
+
+    // 2. Local Keyword Search (MiniSearch)
+    let keywordDocs = [];
+    if (isHybrid) {
+      if (isGlobalQuery && activeFileNames.length > 1) {
+        // Multi-document summary query: retrieve top keyword matches per active document
+        for (const fileName of activeFileNames) {
+          const keywordResults = store.miniSearch.search(searchQuestion, {
+            limit: 3,
+            filter: (hit) => hit.source === fileName && !this._isBoilerplateChunk(hit.text)
+          });
+          keywordDocs.push(...keywordResults.map(hit => ({
+            pageContent: hit.text,
+            metadata: hit.metadata,
+            score: hit.score
+          })));
+        }
+      } else {
+        // Standard query: search miniSearch filtering to active scope
+        const keywordResults = store.miniSearch.search(searchQuestion, {
+          limit: retrieveLimit,
+          filter: (hit) => activeFileNames.includes(hit.source) && !this._isBoilerplateChunk(hit.text)
+        });
+        keywordDocs = keywordResults.map(hit => ({
+          pageContent: hit.text,
+          metadata: hit.metadata,
+          score: hit.score
+        }));
+      }
+    }
+
+    // 3. Merge & Deduplicate candidates
+    const mergedCandidatesMap = new Map();
+
+    // Add vector hits
+    vectorDocs.forEach(doc => {
+      const key = `${doc.metadata?.source || 'unknown'}_${doc.metadata?.chunkIndex || 0}`;
+      mergedCandidatesMap.set(key, { ...doc, sourceChannel: 'vector' });
+    });
+
+    // Add keyword hits (merging and updating scores if duplicate)
+    keywordDocs.forEach(doc => {
+      const key = `${doc.metadata?.source || 'unknown'}_${doc.metadata?.chunkIndex || 0}`;
+      if (mergedCandidatesMap.has(key)) {
+        const existing = mergedCandidatesMap.get(key);
+        existing.score += doc.score; // Boost score if found in both
+        existing.sourceChannel = 'hybrid';
+      } else {
+        mergedCandidatesMap.set(key, { ...doc, sourceChannel: 'keyword' });
+      }
+    });
+
+    const candidates = Array.from(mergedCandidatesMap.values());
+
+    // 4. Local Cross-Encoder Reranking
+    let finalRelevantDocs = [];
+    if (candidates.length > 0) {
+      if (isReranking) {
+        logger.info(`Running local reranker on ${candidates.length} candidates...`);
+        const rerankerInstance = await this._getReranker();
+        const scoredCandidates = [];
+
+        for (const cand of candidates) {
+          try {
+            // Reranker inputs: [query, document]
+            const output = await rerankerInstance({
+              inputs: {
+                text: searchQuestion,
+                text_pair: cand.pageContent
+              }
+            });
+            const score = output.score || (output[0] && output[0].score) || 0;
+            scoredCandidates.push({ cand, score });
+          } catch (err) {
+            logger.error('Failed to score candidate in reranker:', err);
+            scoredCandidates.push({ cand, score: 0 });
+          }
+        }
+
+        // Apply diversity slice if global/library-wide summary
+        if (isGlobalQuery && activeFileNames.length > 1) {
+          const groupedByDoc = {};
+          scoredCandidates.forEach(sc => {
+            const source = sc.cand.metadata?.source || 'unknown';
+            if (!groupedByDoc[source]) groupedByDoc[source] = [];
+            groupedByDoc[source].push(sc);
+          });
+
+          const chunksPerDoc = Math.max(2, Math.floor(12 / activeFileNames.length));
+          const diverseCandidates = [];
+
+          Object.values(groupedByDoc).forEach((scList) => {
+            scList.sort((a, b) => b.score - a.score);
+            diverseCandidates.push(...scList.slice(0, chunksPerDoc));
+          });
+
+          diverseCandidates.sort((a, b) => b.score - a.score);
+          finalRelevantDocs = diverseCandidates.map(sc => ({
+            pageContent: sc.cand.pageContent,
+            metadata: sc.cand.metadata
+          }));
+        } else {
+          // Sort descending by rerank score
+          scoredCandidates.sort((a, b) => b.score - a.score);
+          // Take top K elements
+          finalRelevantDocs = scoredCandidates.slice(0, topK).map(sc => {
+            const doc = sc.cand;
+            return {
+              pageContent: doc.pageContent,
+              metadata: doc.metadata
+            };
+          });
+        }
+      } else {
+        logger.info(`Bypassing local reranker. Sorting candidates by score...`);
+        if (isGlobalQuery && activeFileNames.length > 1) {
+          const groupedByDoc = {};
+          candidates.forEach(cand => {
+            const source = cand.metadata?.source || 'unknown';
+            if (!groupedByDoc[source]) groupedByDoc[source] = [];
+            groupedByDoc[source].push(cand);
+          });
+
+          const chunksPerDoc = Math.max(2, Math.floor(12 / activeFileNames.length));
+          const diverseCandidates = [];
+
+          Object.values(groupedByDoc).forEach((candList) => {
+            candList.sort((a, b) => b.score - a.score);
+            diverseCandidates.push(...candList.slice(0, chunksPerDoc));
+          });
+
+          diverseCandidates.sort((a, b) => b.score - a.score);
+          finalRelevantDocs = diverseCandidates.map(doc => ({
+            pageContent: doc.pageContent,
+            metadata: doc.metadata
+          }));
+        } else {
+          // Sort descending by raw score
+          const sortedCandidates = [...candidates].sort((a, b) => b.score - a.score);
+          finalRelevantDocs = sortedCandidates.slice(0, topK).map(doc => ({
+            pageContent: doc.pageContent,
+            metadata: doc.metadata
+          }));
+        }
+      }
+    } else {
+      finalRelevantDocs = [];
+    }
+
+    logger.info(`Retrieval complete. Selected top ${finalRelevantDocs.length} chunks`);
+
+    // Group documents by source for cleaner context delivery
+    const docsBySource = finalRelevantDocs.reduce((acc, doc) => {
+      const source = doc.metadata?.source || 'unknown';
+      if (!acc[source]) acc[source] = [];
+      acc[source].push(doc);
+      return acc;
+    }, {});
+
+    const sources = Object.keys(docsBySource);
+    const contextParts = Object.entries(docsBySource).map(([source, docs]) => {
+      const content = docs.map(doc => doc.pageContent).join('\n');
+      return `=== From document: ${source} ===\n${content}`;
+    });
+    const context = contextParts.join('\n\n');
+
+    let historyText = "";
+    if (history && history.length > 0) {
+      historyText = "Chat History:\n" + history.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join("\n") + "\n\n";
+    }
+
+    // Resolve system prompt instructions and temperature based on agentId
+    let systemInstruction = "You are a helpful AI assistant that answers questions based on multiple documents.";
+    let temperature = 0.7;
+
+    if (agentId) {
+      const agent = await prisma.agent.findUnique({
+        where: { id: agentId }
+      });
+      if (agent && agent.userId === userId) {
+        systemInstruction = agent.systemPrompt;
+        temperature = agent.temperature;
+        logger.info(`Injecting agent system prompt: "${agent.name}" (temperature: ${temperature})`);
+      }
+    }
+
+    let summaryGuidelines = "";
+    if (isGlobalQuery && activeFileNames.length > 1) {
+      summaryGuidelines = `\n- The user is asking for a summary, comparison, or list of key points across multiple documents. Please structure your response to provide a clear, document-by-document summary or comparison, summarizing the key points of EACH document individually so the user gets a complete overview of all documents.`;
+    }
+
+    const prompt = `
+${systemInstruction}
+
 Use the following pieces of context from different documents to answer the user's question.
 When possible, mention which document(s) your answer comes from.
 If information is available in multiple documents, synthesize a comprehensive answer.
 If you don't know the answer based on the context, just say that you don't know.
 Don't try to make up an answer.
 
-Available Documents: ${sources.join(', ')}
+${historyText}Available Documents: ${sources.join(', ')}
 
 Context:
 ${context}
@@ -362,125 +749,305 @@ Instructions:
 - Provide a detailed answer based on the context above
 - When relevant, mention which document(s) contain the information
 - If multiple documents have related information, combine insights from all sources
-- Be specific about what each document contributes to your answer
+- Be specific about what each document contributes to your answer${summaryGuidelines}
 
 Answer:`;
 
-      // Get response from Gemini with retry logic
-      let answer;
-      let attempt = 0;
-      const maxRetries = 3;
-      const baseDelay = 2000; // 2 seconds
+    const sourceInfo = Object.entries(docsBySource).map(([source, docs]) => ({
+      document: source,
+      chunksUsed: docs.length,
+      chunkIndices: docs.map(doc => doc.metadata?.chunkIndex || 0)
+    }));
 
-      while (attempt < maxRetries) {
-        try {
-          logger.info(`Generating response with Gemini (attempt ${attempt + 1}/${maxRetries})`);
-          const result = await this.model.generateContent(prompt);
-          answer = result.response.text();
-          break; // Success, exit retry loop
-        } catch (error) {
-          attempt++;
-          // Handle rate limit errors - don't retry, fail fast
-          if (error.message.includes('429') || error.message.includes('quota')) {
-            logger.error('Rate limit hit on Gemini API');
-            const cooldownMs = config.rateLimitCooldownMs || 60000;
-            this.rateLimitCooldownUntil = Date.now() + cooldownMs;
-            const seconds = Math.ceil(cooldownMs / 1000);
-            throw new AppError(`Gemini API rate limit exceeded. Please wait ${seconds} seconds before trying again.`, 429);
-          }
+    return {
+      prompt,
+      finalRelevantDocs,
+      sources,
+      sourceInfo,
+      userDocs,
+      temperature
+    };
+  }
 
-          if (error.message.includes('503') || error.message.includes('overloaded')) {
-            if (attempt < maxRetries) {
-              const delay = baseDelay * Math.pow(2, attempt - 1); // Exponential backoff
-              logger.warn(`Gemini API overloaded (attempt ${attempt}). Retrying in ${delay}ms...`);
-              await new Promise(resolve => setTimeout(resolve, delay));
-            } else {
-              logger.error('All retry attempts failed for Gemini API');
-              throw new AppError('Gemini service is temporarily unavailable. Please try again in a few minutes.', 503);
-            }
-          } else {
-            // Other errors, don't retry
-            throw error;
-          }
-        }
+  async query(question, history = [], userId, selectedDocumentIds = null, agentId = null, retrievalOptions = {}) {
+    try {
+      if (!userId) throw new AppError('userId is required to query documents', 400);
+
+      const now = Date.now();
+      if (config.rateLimitCooldownMs && this.rateLimitCooldownUntil && now < this.rateLimitCooldownUntil) {
+        const secondsRemaining = Math.ceil((this.rateLimitCooldownUntil - now) / 1000);
+        throw new AppError(
+          `Gemini API rate limit hit recently. Please wait ${secondsRemaining} seconds before asking another question.`,
+          429
+        );
       }
 
-      // Enhanced metadata with source information
-      const sourceInfo = Object.entries(docsBySource).map(([source, docs]) => ({
-        document: source,
-        chunksUsed: docs.length,
-        chunkIndices: docs.map(doc => doc.metadata?.chunkIndex || 0)
-      }));
+      logger.info(`Query: "${question}" for user ${userId} with options: ${JSON.stringify(retrievalOptions)}`);
 
-      logger.info(`Query processed successfully. Answer generated from ${sources.length} different documents`);
+      const { prompt, finalRelevantDocs, sources, sourceInfo, userDocs, temperature } = 
+        await this._prepareContextAndPrompt(question, history, userId, selectedDocumentIds, agentId, retrievalOptions);
+
+      // Get response from Gemini with temperature configuration
+      let answer;
+      try {
+        const result = await this.model.generateContent({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature }
+        });
+        answer = result.response.text();
+      } catch (error) {
+        if (error.message.includes('429') || error.message.includes('quota')) {
+          const cooldownMs = config.rateLimitCooldownMs || 60000;
+          this.rateLimitCooldownUntil = Date.now() + cooldownMs;
+          const seconds = Math.ceil(cooldownMs / 1000);
+          throw new AppError(`Gemini API rate limit exceeded. Please wait ${seconds} seconds before trying again.`, 429);
+        }
+        throw error;
+      }
 
       return {
         success: true,
         answer: answer,
-        sourceDocuments: relevantDocs,
+        sourceDocuments: finalRelevantDocs,
         metadata: {
           question,
           timestamp: new Date().toISOString(),
-          sourcesCount: relevantDocs.length,
+          sourcesCount: finalRelevantDocs.length,
           documentsUsed: sources.length,
           documentSources: sources,
           sourceBreakdown: sourceInfo,
-          totalDocumentsAvailable: this.documents.length
+          totalDocumentsAvailable: userDocs.length
         }
       };
     } catch (error) {
       logger.error('Error processing query:', error);
-      // If this is already an AppError (for example, a 429 rate limit error),
-      // propagate it without changing the status code so the client sees the
-      // correct error type.
-      if (error instanceof AppError) {
-        throw error;
-      }
-
+      if (error instanceof AppError) throw error;
       throw new AppError(`Failed to process query: ${error.message}`, 500);
     }
   }
 
-  async getStatus() {
-    const totalChunks = this.documents.reduce((sum, doc) => sum + doc.chunksCount, 0);
+  async queryStream(question, history = [], userId, selectedDocumentIds = null, agentId = null, onChunk, retrievalOptions = {}) {
+    try {
+      if (!userId) throw new AppError('userId is required to query documents', 400);
+
+      const now = Date.now();
+      if (config.rateLimitCooldownMs && this.rateLimitCooldownUntil && now < this.rateLimitCooldownUntil) {
+        const secondsRemaining = Math.ceil((this.rateLimitCooldownUntil - now) / 1000);
+        onChunk({
+          type: 'error',
+          message: `Gemini API rate limit hit recently. Please wait ${secondsRemaining} seconds and try again.`
+        });
+        return;
+      }
+
+      logger.info(`Query Stream: "${question}" for user ${userId} with options: ${JSON.stringify(retrievalOptions)}`);
+
+      const { prompt, finalRelevantDocs, sources, sourceInfo, userDocs, temperature } = 
+        await this._prepareContextAndPrompt(question, history, userId, selectedDocumentIds, agentId, retrievalOptions);
+
+      // Call streaming API with temperature configuration
+      const result = await this.model.generateContentStream({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { temperature }
+      });
+
+      // Send initial metadata chunk first
+      onChunk({
+        type: 'metadata',
+        sourceDocuments: finalRelevantDocs,
+        metadata: {
+          question,
+          timestamp: new Date().toISOString(),
+          sourcesCount: finalRelevantDocs.length,
+          documentsUsed: sources.length,
+          documentSources: sources,
+          sourceBreakdown: sourceInfo,
+          totalDocumentsAvailable: userDocs.length
+        }
+      });
+
+      // Stream tokens
+      for await (const chunk of result.stream) {
+        onChunk({
+          type: 'content',
+          text: chunk.text()
+        });
+      }
+    } catch (error) {
+      logger.error('Error in queryStream service:', error);
+      if (error.message && (error.message.includes('429') || error.message.includes('quota'))) {
+        const cooldownMs = config.rateLimitCooldownMs || 60000;
+        this.rateLimitCooldownUntil = Date.now() + cooldownMs;
+        onChunk({
+          type: 'error',
+          message: 'Gemini API rate limit exceeded. Please wait 60 seconds and try again.'
+        });
+        return;
+      }
+      onChunk({
+        type: 'error',
+        message: error.message
+      });
+    }
+  }
+
+  async getStatus(userId) {
+    if (!userId) return { isReady: false, message: 'No userId provided' };
+    const store = await this._getUserStore(userId);
+    const userDocs = await prisma.document.findMany({ where: { userId } });
 
     return {
-      isReady: !!this.vectorStore && !!this.retriever,
-      documentsCount: this.documents.length,
-      totalChunks: totalChunks,
-      hasRetriever: !!this.retriever,
-      hasModel: !!this.model,
+      isReady: userDocs.length > 0 && store.vectorStore.memoryVectors.length > 0,
+      documentsCount: userDocs.length,
+      totalChunks: store.vectorStore.memoryVectors.length,
+      hasRetriever: userDocs.length > 0,
+      hasModel: true,
       aiProvider: 'Gemini',
-      documents: this.documents.map(doc => ({
+      documents: userDocs.map(doc => ({
         fileName: doc.fileName,
         chunksCount: doc.chunksCount,
-        uploadedAt: doc.uploadedAt
+        uploadedAt: doc.createdAt.toISOString()
       }))
     };
   }
 
-  async getDocuments() {
+  async getDocuments(userId) {
+    if (!userId) return { success: true, documents: [], totalDocuments: 0, totalChunks: 0 };
+    const userDocs = await prisma.document.findMany({ where: { userId } });
+    
     return {
       success: true,
-      documents: this.documents,
-      totalDocuments: this.documents.length,
-      totalChunks: this.documents.reduce((sum, doc) => sum + doc.chunksCount, 0)
+      documents: userDocs.map(doc => ({
+        id: doc.id,
+        fileName: doc.fileName,
+        originalFileName: doc.originalFileName,
+        filePath: doc.filePath,
+        chunksCount: doc.chunksCount,
+        uploadedAt: doc.createdAt.toISOString(),
+        size: doc.size,
+        fileType: doc.fileType,
+        mode: 'append'
+      })),
+      totalDocuments: userDocs.length,
+      totalChunks: userDocs.reduce((sum, doc) => sum + doc.chunksCount, 0)
     };
   }
 
-  async reset() {
+  async deleteDocument(userId, docId) {
     try {
-      this.vectorStore = null;
-      this.retriever = null;
-      this.documents = [];
-      logger.info('RAG service reset successfully - all documents cleared');
-      return { success: true, message: 'RAG service reset - all documents cleared' };
+      if (!userId) throw new AppError('userId is required', 400);
+      if (!docId) throw new AppError('docId is required', 400);
+
+      // Find the document first
+      const document = await prisma.document.findFirst({
+        where: { id: docId, userId }
+      });
+
+      if (!document) {
+        throw new AppError('Document not found or access denied.', 404);
+      }
+
+      const fileName = document.fileName;
+      const filePath = document.filePath;
+
+      // 1. Remove file from disk if it exists
+      if (filePath && fs.existsSync(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+          logger.info(`Deleted file from disk: ${filePath}`);
+        } catch (fileErr) {
+          logger.error(`Failed to delete file from disk: ${filePath}`, fileErr);
+        }
+      }
+
+      // 2. Load the user's RAG store
+      const store = await this._getUserStore(userId);
+
+      // 3. Remove chunks from Vector Store
+      if (store.vectorStore && store.vectorStore.memoryVectors) {
+        const initialCount = store.vectorStore.memoryVectors.length;
+        store.vectorStore.memoryVectors = store.vectorStore.memoryVectors.filter(
+          mv => mv.metadata?.source !== fileName
+        );
+        store.docsCount = store.vectorStore.memoryVectors.length;
+        logger.info(`Removed ${initialCount - store.docsCount} chunks from vector store for document: ${fileName}`);
+      }
+
+      // 4. Remove chunks from MiniSearch
+      if (store.miniSearch) {
+        // Rebuild MiniSearch index from the remaining memory vectors
+        const newMiniSearch = new MiniSearch({
+          fields: ['text'],
+          storeFields: ['id', 'text', 'metadata', 'source'],
+          searchOptions: { boost: { text: 1 }, fuzzy: 0.2 }
+        });
+
+        const searchDocs = store.vectorStore.memoryVectors.map((mv, idx) => ({
+          id: `${mv.metadata?.source || fileName}_${idx}_${Date.now()}`,
+          text: mv.content || mv.pageContent || '',
+          metadata: mv.metadata,
+          source: mv.metadata?.source || fileName
+        }));
+
+        if (searchDocs.length > 0) {
+          await newMiniSearch.addAll(searchDocs);
+        }
+        store.miniSearch = newMiniSearch;
+        logger.info(`Rebuilt MiniSearch index with ${searchDocs.length} remaining chunks`);
+      }
+
+      // 5. Persist the updated store
+      await this._persistUserStore(userId, store);
+
+      // 6. Delete document record from DB
+      await prisma.document.delete({
+        where: { id: docId }
+      });
+
+      // 7. Also clear from CSV/Excel memory caches
+      try {
+        const csvService = (await import('./csvService.js')).default;
+        const excelService = (await import('./excelService.js')).default;
+        csvService.userStores.delete(`${userId}_${docId}`);
+        excelService.userStores.delete(`${userId}_${docId}`);
+      } catch (err) {
+        logger.error('Failed to clear tabular caches during document delete', err);
+      }
+
+      logger.info(`Successfully deleted document ${docId} (${fileName}) for user ${userId}`);
+      return { success: true, message: 'Document deleted successfully' };
     } catch (error) {
-      logger.error('Error resetting RAG service:', error);
-      throw new AppError('Failed to reset RAG service', 500);
+      logger.error('Error deleting document:', error);
+      if (error instanceof AppError) throw error;
+      throw new AppError(`Failed to delete document: ${error.message}`, 500);
+    }
+  }
+
+  async reset(userId) {
+    try {
+      if (!userId) throw new AppError('userId is required to reset', 400);
+
+      // Clear memory cache
+      this.userStores.delete(userId);
+
+      // Clear local disk indices
+      const { userDir } = this._getUserIndexPaths(userId);
+      if (fs.existsSync(userDir)) {
+        fs.rmSync(userDir, { recursive: true, force: true });
+      }
+
+      // Clear database documents
+      await prisma.document.deleteMany({
+        where: { userId }
+      });
+
+      logger.info(`Reset index files and DB records for user ${userId}`);
+      return { success: true, message: 'Local files and databases reset successfully' };
+    } catch (error) {
+      logger.error('Error resetting user store:', error);
+      throw new AppError('Failed to reset user index data.', 500);
     }
   }
 }
 
-// Export singleton instance
 export default new RAGService();

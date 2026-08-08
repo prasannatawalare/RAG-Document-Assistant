@@ -1,6 +1,10 @@
 import fs from 'fs';
+import path from 'path';
 import { parse } from 'csv-parse/sync';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import sandboxService from './sandboxService.js';
+import ragService from './ragService.js';
+import prisma from '../db.js';
 
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
@@ -8,12 +12,8 @@ import { AppError } from '../middleware/errorHandler.js';
 
 class CSVService {
   constructor() {
-    this.csvData = null;
-    this.columns = [];
-    this.stats = [];
-    this.fileName = null;
-    this.originalFileName = null;
-    this.uploadedAt = null;
+    // Map of userId -> { csvData, columns, stats, fileName, originalFileName, uploadedAt }
+    this.userStores = new Map();
 
     // Initialize Gemini
     this.genAI = new GoogleGenerativeAI(config.geminiApiKey);
@@ -30,20 +30,109 @@ class CSVService {
     logger.info('CSV Service initialized');
   }
 
+  // Helper to fetch or initialize a user's CSV store by docId
+  _getUserStore(userId, docId = 'default') {
+    if (!userId) throw new AppError('userId is required', 400);
+    const key = `${userId}_${docId}`;
+    if (!this.userStores.has(key)) {
+      this.userStores.set(key, {
+        csvData: null,
+        columns: [],
+        stats: [],
+        fileName: null,
+        originalFileName: null,
+        uploadedAt: null
+      });
+    }
+    return this.userStores.get(key);
+  }
+
+  // Load from disk if not in memory cache (survives restarts & handles multiple files)
+  async _getOrLoadUserStore(userId, docId = null) {
+    if (!userId) throw new AppError('userId is required', 400);
+    
+    let targetDocId = docId;
+    if (!targetDocId) {
+      const recentDoc = await prisma.document.findFirst({
+        where: { userId, fileType: 'csv' },
+        orderBy: { createdAt: 'desc' }
+      });
+      if (!recentDoc) return { csvData: [], columns: [], stats: [] };
+      targetDocId = recentDoc.id;
+    }
+
+    const key = `${userId}_${targetDocId}`;
+    if (this.userStores.has(key) && this.userStores.get(key).csvData) {
+      return this.userStores.get(key);
+    }
+
+    // Load from DB & Disk
+    const doc = await prisma.document.findFirst({
+      where: { id: targetDocId, userId }
+    });
+    if (!doc || !fs.existsSync(doc.filePath)) {
+      return { csvData: [], columns: [], stats: [] };
+    }
+
+    // Read and parse
+    const fileContent = fs.readFileSync(doc.filePath, 'utf-8');
+    const records = parse(fileContent, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+      cast: false
+    });
+
+    const store = {
+      csvData: null,
+      columns: [],
+      stats: [],
+      fileName: doc.fileName,
+      originalFileName: doc.originalFileName,
+      uploadedAt: doc.createdAt.toISOString(),
+      filePath: doc.filePath
+    };
+
+    const columnKeys = Object.keys(records[0]);
+    store.columns = columnKeys.map(key => {
+      const values = records.map(row => row[key]);
+      const type = this.detectColumnType(values);
+      return { key, label: key, type };
+    });
+
+    store.stats = store.columns.map(col => {
+      const values = records.map(row => row[col.key]);
+      return this.calculateColumnStats(col.key, values, col.type);
+    });
+
+    store.csvData = records.map(row => {
+      const processedRow = {};
+      for (const col of store.columns) {
+        const value = row[col.key];
+        if (col.type === 'number' && value !== '' && value !== null) {
+          processedRow[col.key] = parseFloat(value);
+        } else {
+          processedRow[col.key] = value;
+        }
+      }
+      return processedRow;
+    });
+
+    this.userStores.set(key, store);
+    return store;
+  }
+
   // Detect column type
   detectColumnType(values) {
     const nonNullValues = values.filter(v => v !== null && v !== '' && v !== undefined);
     if (nonNullValues.length === 0) return 'string';
 
-    // Check if all values are numbers
     const numericCount = nonNullValues.filter(v => !isNaN(parseFloat(v)) && isFinite(v)).length;
     if (numericCount === nonNullValues.length) return 'number';
 
-    // Check if all values are dates
     const dateCount = nonNullValues.filter(v => !isNaN(Date.parse(v))).length;
     if (dateCount === nonNullValues.length && dateCount > 0) return 'date';
 
-    // Check if all values are boolean
     const boolValues = ['true', 'false', 'yes', 'no', '1', '0'];
     const boolCount = nonNullValues.filter(v =>
       boolValues.includes(String(v).toLowerCase())
@@ -83,8 +172,10 @@ class CSVService {
 
   async processCSV(filePath, options = {}) {
     try {
-      const { originalFileName, mode = 'replace' } = options;
-      logger.info(`Processing CSV: ${filePath} (mode: ${mode})`);
+      const { originalFileName, mode = 'replace', userId } = options;
+      if (!userId) throw new AppError('userId is required to process CSV', 400);
+
+      logger.info(`Processing CSV: ${filePath} for user: ${userId} (mode: ${mode})`);
 
       // Read the file
       const fileContent = fs.readFileSync(filePath, 'utf-8');
@@ -94,33 +185,54 @@ class CSVService {
         columns: true,
         skip_empty_lines: true,
         trim: true,
-        cast: false // Keep as strings initially for type detection
+        cast: false
       });
 
       if (!records || records.length === 0) {
         throw new AppError('CSV file is empty or invalid', 400);
       }
 
-      // Get column names
+      let fullFileName = filePath.split(path.sep).pop() || filePath;
+      const cleanFileName = fullFileName.replace(/^\d+-\d+-/, '');
+
+      // Record document in database first
+      const fileStats = fs.existsSync(filePath) ? fs.statSync(filePath) : { size: fileContent.length };
+      const doc = await prisma.document.create({
+        data: {
+          fileName: cleanFileName,
+          originalFileName: originalFileName || cleanFileName,
+          filePath,
+          fileType: 'csv',
+          size: fileStats.size,
+          chunksCount: 0, // Will update below
+          userId
+        }
+      });
+      const docId = doc.id;
+
+      // Associate cache with docId
+      const store = this._getUserStore(userId, docId);
+      store.fileName = cleanFileName;
+      store.originalFileName = originalFileName || cleanFileName;
+      store.uploadedAt = doc.createdAt.toISOString();
+      store.filePath = filePath;
+
       const columnKeys = Object.keys(records[0]);
 
-      // Detect column types and calculate stats
-      this.columns = columnKeys.map(key => {
+      store.columns = columnKeys.map(key => {
         const values = records.map(row => row[key]);
         const type = this.detectColumnType(values);
         return { key, label: key, type };
       });
 
-      // Calculate statistics
-      this.stats = this.columns.map(col => {
+      store.stats = store.columns.map(col => {
         const values = records.map(row => row[col.key]);
         return this.calculateColumnStats(col.key, values, col.type);
       });
 
-      // Store data (convert numbers where appropriate)
-      this.csvData = records.map(row => {
+      store.csvData = records.map(row => {
         const processedRow = {};
-        for (const col of this.columns) {
+        for (const col of store.columns) {
           const value = row[col.key];
           if (col.type === 'number' && value !== '' && value !== null) {
             processedRow[col.key] = parseFloat(value);
@@ -131,33 +243,60 @@ class CSVService {
         return processedRow;
       });
 
-      // Extract filename
-      let fullFileName;
-      if (filePath.includes('\\')) {
-        fullFileName = filePath.split('\\').pop();
-      } else if (filePath.includes('/')) {
-        fullFileName = filePath.split('/').pop();
-      } else {
-        fullFileName = filePath;
+      // Convert CSV rows to text chunks for RAG indexing
+      const maxRowsPerChunk = 25;
+      const RAGDocs = [];
+      
+      for (let i = 0; i < store.csvData.length; i += maxRowsPerChunk) {
+        const rowSlice = store.csvData.slice(i, i + maxRowsPerChunk);
+        const chunkText = rowSlice.map((row, idx) => {
+          const rowIdx = i + idx + 1;
+          const rowStr = Object.entries(row)
+            .map(([key, val]) => `${key}: ${val}`)
+            .join(', ');
+          return `[Row ${rowIdx}] ${rowStr}`;
+        }).join('\n');
+
+        RAGDocs.push({
+          pageContent: `Document: ${cleanFileName}\nColumns: ${columnKeys.join(', ')}\nRows ${i + 1} to ${i + rowSlice.length} of ${store.csvData.length}:\n${chunkText}`,
+          metadata: {
+            source: cleanFileName,
+            originalFileName: originalFileName || cleanFileName,
+            filePath,
+            startRow: i + 1,
+            endRow: i + rowSlice.length,
+          }
+        });
       }
-      const cleanFileName = fullFileName.replace(/^\d+-\d+-/, '');
 
-      this.fileName = cleanFileName;
-      this.originalFileName = originalFileName || cleanFileName;
-      this.uploadedAt = new Date().toISOString();
+      // Index in RAG service using processRawText
+      await ragService.processRawText(RAGDocs, {
+        mode: mode,
+        cleanFileName,
+        fullFileName: originalFileName || cleanFileName,
+        filePath,
+        userId
+      });
 
-      logger.info(`CSV processed: ${this.csvData.length} rows, ${this.columns.length} columns`);
+      // Update DB with the correct chunksCount
+      await prisma.document.update({
+        where: { id: docId },
+        data: { chunksCount: RAGDocs.length }
+      });
+
+      logger.info(`CSV processed: ${store.csvData.length} rows, ${store.columns.length} columns, ${RAGDocs.length} chunks for user ${userId}`);
 
       return {
         success: true,
-        fileName: this.fileName,
-        originalFileName: this.originalFileName,
-        rowCount: this.csvData.length,
-        columnCount: this.columns.length,
-        columns: this.columns,
-        preview: this.csvData.slice(0, 10), // First 10 rows as preview
-        stats: this.stats,
-        message: `CSV file processed successfully. ${this.csvData.length} rows, ${this.columns.length} columns.`
+        documentId: docId,
+        fileName: store.fileName,
+        originalFileName: store.originalFileName,
+        rowCount: store.csvData.length,
+        columnCount: store.columns.length,
+        columns: store.columns,
+        preview: store.csvData.slice(0, 10),
+        stats: store.stats,
+        message: `CSV file processed successfully. ${store.csvData.length} rows, ${store.columns.length} columns.`
       };
     } catch (error) {
       logger.error('Error processing CSV:', error);
@@ -166,78 +305,23 @@ class CSVService {
     }
   }
 
-  async queryCSV(question) {
+  async queryCSV(question, userId, docId = null) {
     try {
-      if (!this.csvData || this.csvData.length === 0) {
+      const store = await this._getOrLoadUserStore(userId, docId);
+
+      if (!store.csvData || store.csvData.length === 0) {
         throw new AppError('No CSV data loaded. Please upload a CSV file first.', 400);
       }
 
-      logger.info(`Processing CSV query: "${question}"`);
+      logger.info(`Processing CSV query for user ${userId} (doc: ${docId || 'recent'}): "${question}"`);
 
-      // Prepare data summary for the AI
-      const columnInfo = this.columns.map(col => {
-        const stat = this.stats.find(s => s.column === col.key);
-        let info = `${col.key} (${col.type})`;
-        if (stat) {
-          if (col.type === 'number') {
-            info += ` - min: ${stat.min}, max: ${stat.max}, mean: ${stat.mean?.toFixed(2)}`;
-          }
-          info += `, unique values: ${stat.unique}`;
-        }
-        return info;
-      }).join('\n  ');
-
-      // Sample data for context (first 5 rows)
-      const sampleData = JSON.stringify(this.csvData.slice(0, 5), null, 2);
-
-      const prompt = `You are a data analyst assistant. You have access to a CSV dataset with the following structure:
-
-File: ${this.fileName}
-Total Rows: ${this.csvData.length}
-Columns:
-  ${columnInfo}
-
-Sample Data (first 5 rows):
-${sampleData}
-
-User Question: ${question}
-
-Instructions:
-1. Analyze the question and provide a clear, helpful answer based on the data.
-2. If the question requires calculations, show the calculation and result.
-3. If you need to reference specific data, be precise.
-4. If the question asks for visualization/chart, describe what type of chart would be appropriate and what data it would show.
-5. Format numbers nicely (use commas for thousands, round decimals appropriately).
-6. If you cannot answer the question with the available data, explain why.
-
-Provide your answer in a clear, structured format.`;
-
-      // Generate response
-      const result = await this.model.generateContent(prompt);
-      const answer = result.response.text();
-
-      // Try to detect if a chart would be helpful
-      let chartData = null;
-      const chartKeywords = ['chart', 'graph', 'plot', 'visualize', 'show me', 'distribution', 'trend', 'compare', 'top 10', 'top 5', 'top ten', 'top five', 'highest', 'lowest', 'bar chart', 'pie chart'];
-      const wantsChart = chartKeywords.some(kw => question.toLowerCase().includes(kw));
-
-      if (wantsChart) {
-        chartData = this.generateChartData(question);
-      }
-
-      logger.info('CSV query processed successfully');
-
-      return {
-        success: true,
-        answer,
-        chartData,
-        metadata: {
-          question,
-          timestamp: new Date().toISOString(),
-          rowsAnalyzed: this.csvData.length,
-          fileName: this.fileName
-        }
-      };
+      return await sandboxService.analyzeTabularFile(
+        question,
+        store.filePath,
+        'csv',
+        store.columns,
+        store.csvData.slice(0, 5)
+      );
     } catch (error) {
       logger.error('Error processing CSV query:', error);
       if (error instanceof AppError) throw error;
@@ -245,63 +329,50 @@ Provide your answer in a clear, structured format.`;
     }
   }
 
-  generateChartData(question) {
+  async generateChartData(question, userId, docId = null) {
     try {
+      const store = await this._getOrLoadUserStore(userId, docId);
       const questionLower = question.toLowerCase();
 
-      // Find numeric and categorical columns
-      const numericCols = this.columns.filter(c => c.type === 'number');
-      const categoricalCols = this.columns.filter(c => c.type === 'string');
+      const numericCols = store.columns.filter(c => c.type === 'number');
+      const categoricalCols = store.columns.filter(c => c.type === 'string');
 
-      if (numericCols.length === 0) {
-        return null; // No numeric data to chart
-      }
+      if (numericCols.length === 0) return null;
 
-      // Try to find columns mentioned in the question
       let valueCol = null;
       let labelCol = null;
 
-      // Find value column (numeric) mentioned in question
       for (const col of numericCols) {
         const colNameLower = col.key.toLowerCase().replace(/[_-]/g, ' ');
-        if (questionLower.includes(colNameLower) ||
-            questionLower.includes(col.key.toLowerCase())) {
+        if (questionLower.includes(colNameLower) || questionLower.includes(col.key.toLowerCase())) {
           valueCol = col.key;
           break;
         }
       }
 
-      // Find label column (categorical) mentioned in question
-      // Look for common label identifiers
       const labelKeywords = ['name', 'company', 'product', 'category', 'type', 'country', 'region', 'sector'];
       for (const col of categoricalCols) {
         const colNameLower = col.key.toLowerCase();
-        if (questionLower.includes(colNameLower) ||
-            labelKeywords.some(kw => colNameLower.includes(kw))) {
+        if (questionLower.includes(colNameLower) || labelKeywords.some(kw => colNameLower.includes(kw))) {
           labelCol = col.key;
           break;
         }
       }
 
-      // Fallback to first columns if not found
       if (!valueCol) valueCol = numericCols[0]?.key;
       if (!labelCol) labelCol = categoricalCols[0]?.key;
 
       if (!labelCol || !valueCol) return null;
 
-      // Parse number of items to show (default 10)
       let topN = 10;
       const topMatch = questionLower.match(/top\s*(\d+)/);
       if (topMatch) {
         topN = parseInt(topMatch[1], 10);
       }
 
-      // Check for "lowest" or "bottom" to reverse sort
       const isDescending = !questionLower.includes('lowest') && !questionLower.includes('bottom');
 
-      // Get data directly without aggregation for "top N" queries
-      // Sort by value column
-      const sortedData = [...this.csvData]
+      const sortedData = [...store.csvData]
         .filter(row => row[valueCol] !== null && row[valueCol] !== undefined && row[valueCol] !== '')
         .sort((a, b) => {
           const aVal = parseFloat(a[valueCol]) || 0;
@@ -313,13 +384,10 @@ Provide your answer in a clear, structured format.`;
       const labels = sortedData.map(row => String(row[labelCol] || 'Unknown'));
       const data = sortedData.map(row => parseFloat(row[valueCol]) || 0);
 
-      // Determine chart type based on question
       let chartType = 'bar';
       if (questionLower.includes('pie')) chartType = 'pie';
       else if (questionLower.includes('line') || questionLower.includes('trend')) chartType = 'line';
       else if (questionLower.includes('area')) chartType = 'area';
-
-      logger.info(`Generated chart: ${chartType} with ${labels.length} items, labelCol=${labelCol}, valueCol=${valueCol}`);
 
       return {
         type: chartType,
@@ -335,53 +403,52 @@ Provide your answer in a clear, structured format.`;
     }
   }
 
-  getData(limit = 100, offset = 0) {
-    if (!this.csvData) {
-      return {
-        success: false,
-        error: 'No CSV data loaded'
-      };
+  async getData(userId, limit = 100, offset = 0, docId = null) {
+    const store = await this._getOrLoadUserStore(userId, docId);
+    if (!store.csvData) {
+      return { success: false, error: 'No CSV data loaded' };
     }
 
-    const paginatedData = this.csvData.slice(offset, offset + limit);
+    const paginatedData = store.csvData.slice(offset, offset + limit);
 
     return {
       success: true,
       data: paginatedData,
-      columns: this.columns,
-      totalRows: this.csvData.length,
+      columns: store.columns,
+      totalRows: store.csvData.length,
       limit,
       offset,
-      fileName: this.fileName
+      fileName: store.fileName
     };
   }
 
-  getStats() {
-    if (!this.csvData) {
-      return {
-        success: false,
-        error: 'No CSV data loaded'
-      };
+  async getStats(userId, docId = null) {
+    const store = await this._getOrLoadUserStore(userId, docId);
+    if (!store.csvData) {
+      return { success: false, error: 'No CSV data loaded' };
     }
 
     return {
       success: true,
-      stats: this.stats,
-      columns: this.columns,
-      fileName: this.fileName,
-      rowCount: this.csvData.length,
-      uploadedAt: this.uploadedAt
+      stats: store.stats,
+      columns: store.columns,
+      fileName: store.fileName,
+      rowCount: store.csvData.length,
+      uploadedAt: store.uploadedAt
     };
   }
 
-  reset() {
-    this.csvData = null;
-    this.columns = [];
-    this.stats = [];
-    this.fileName = null;
-    this.originalFileName = null;
-    this.uploadedAt = null;
-    logger.info('CSV service reset');
+  reset(userId) {
+    if (userId) {
+      for (const key of this.userStores.keys()) {
+        if (key.startsWith(`${userId}_`)) {
+          this.userStores.delete(key);
+        }
+      }
+    } else {
+      this.userStores.clear();
+    }
+    logger.info(`CSV data cleared for user: ${userId || 'all'}`);
     return { success: true, message: 'CSV data cleared' };
   }
 }

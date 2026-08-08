@@ -21,6 +21,47 @@ const API_CLIENT = axios.create({
   },
 });
 
+// Automatically add token to headers
+API_CLIENT.interceptors.request.use((config) => {
+  const token = localStorage.getItem('rag_jwt_token');
+  if (token && config.headers) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Handle 401 Unauthorized errors globally
+API_CLIENT.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response && error.response.status === 401) {
+      const url = error.config?.url || '';
+      // Don't auto-logout or reload when verifying credentials on login/register pages
+      if (!url.includes('/auth/login') && !url.includes('/auth/register')) {
+        localStorage.removeItem('rag_jwt_token');
+        window.location.reload();
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+// Authentication endpoints
+export const login = async (email: string, password: string) => {
+  const response = await API_CLIENT.post('/auth/login', { email, password });
+  return response.data;
+};
+
+export const register = async (email: string, password: string) => {
+  const response = await API_CLIENT.post('/auth/register', { email, password });
+  return response.data;
+};
+
+export const getCurrentUser = async () => {
+  const response = await API_CLIENT.get('/auth/me');
+  return response.data;
+};
+
 // Health Check - GET /api/health/
 export const checkHealth = async (): Promise<HealthResponse> => {
   const response = await API_CLIENT.get('/health/');
@@ -72,11 +113,13 @@ export const uploadDocumentSimple = async (
   return response.data;
 };
 
+
+
 // Query Documents (Chat) - POST /api/chat/query
-// Backend only expects { question: string }, no session_id
-export const queryDocuments = async (question: string): Promise<QueryResponse> => {
+export const queryDocuments = async (question: string, history: Array<{role: string, content: string}> = []): Promise<QueryResponse> => {
   const response = await API_CLIENT.post('/chat/query', {
     question,
+    history,
   });
 
   return response.data;
@@ -109,9 +152,10 @@ export const getSystemStatus = async (): Promise<SystemStatus> => {
 // CSV Endpoints
 
 // Query CSV data with natural language - POST /api/documents/csv/query
-export const queryCSV = async (question: string): Promise<CSVQueryResponse> => {
+export const queryCSV = async (question: string, history: Array<{role: string, content: string}> = []): Promise<CSVQueryResponse> => {
   const response = await API_CLIENT.post('/documents/csv/query', {
     question,
+    history,
   });
   return response.data;
 };
@@ -119,7 +163,8 @@ export const queryCSV = async (question: string): Promise<CSVQueryResponse> => {
 // Get CSV data with pagination - GET /api/documents/csv/data
 export const getCSVData = async (
   limit: number = 100,
-  offset: number = 0
+  offset: number = 0,
+  documentId?: string
 ): Promise<{
   success: boolean;
   data: Record<string, unknown>[];
@@ -130,13 +175,13 @@ export const getCSVData = async (
   fileName: string;
 }> => {
   const response = await API_CLIENT.get('/documents/csv/data', {
-    params: { limit, offset },
+    params: { limit, offset, documentId },
   });
   return response.data;
 };
 
 // Get CSV statistics - GET /api/documents/csv/stats
-export const getCSVStats = async (): Promise<{
+export const getCSVStats = async (documentId?: string): Promise<{
   success: boolean;
   stats: CSVStats[];
   columns: CSVColumn[];
@@ -144,16 +189,19 @@ export const getCSVStats = async (): Promise<{
   rowCount: number;
   uploadedAt: string;
 }> => {
-  const response = await API_CLIENT.get('/documents/csv/stats');
+  const response = await API_CLIENT.get('/documents/csv/stats', {
+    params: { documentId },
+  });
   return response.data;
 };
 
 // Excel Endpoints
 
 // Query Excel data with natural language - POST /api/documents/excel/query
-export const queryExcel = async (question: string): Promise<CSVQueryResponse> => {
+export const queryExcel = async (question: string, history: Array<{role: string, content: string}> = []): Promise<CSVQueryResponse> => {
   const response = await API_CLIENT.post('/documents/excel/query', {
     question,
+    history,
   });
   return response.data;
 };
@@ -161,7 +209,8 @@ export const queryExcel = async (question: string): Promise<CSVQueryResponse> =>
 // Get Excel data with pagination - GET /api/documents/excel/data
 export const getExcelData = async (
   limit: number = 100,
-  offset: number = 0
+  offset: number = 0,
+  documentId?: string
 ): Promise<{
   success: boolean;
   data: Record<string, unknown>[];
@@ -174,13 +223,13 @@ export const getExcelData = async (
   activeSheet: string;
 }> => {
   const response = await API_CLIENT.get('/documents/excel/data', {
-    params: { limit, offset },
+    params: { limit, offset, documentId },
   });
   return response.data;
 };
 
 // Get Excel statistics - GET /api/documents/excel/stats
-export const getExcelStats = async (): Promise<{
+export const getExcelStats = async (documentId?: string): Promise<{
   success: boolean;
   stats: CSVStats[];
   columns: CSVColumn[];
@@ -190,8 +239,59 @@ export const getExcelStats = async (): Promise<{
   activeSheet: string;
   uploadedAt: string;
 }> => {
-  const response = await API_CLIENT.get('/documents/excel/stats');
+  const response = await API_CLIENT.get('/documents/excel/stats', {
+    params: { documentId },
+  });
+  return response.data;
+};
+
+// Agent Endpoints
+export interface Agent {
+  id: string;
+  name: string;
+  description: string;
+  systemPrompt: string;
+  temperature: number;
+  createdAt: string;
+}
+
+export const getAgents = async (): Promise<Agent[]> => {
+  const response = await API_CLIENT.get('/agents');
+  return response.data.agents || [];
+};
+
+export const createAgent = async (agentData: {
+  name: string;
+  description?: string;
+  systemPrompt: string;
+  temperature?: number;
+}): Promise<{ success: boolean; agent: Agent }> => {
+  const response = await API_CLIENT.post('/agents', agentData);
+  return response.data;
+};
+
+export const updateAgent = async (
+  id: string,
+  agentData: {
+    name: string;
+    description?: string;
+    systemPrompt: string;
+    temperature?: number;
+  }
+): Promise<{ success: boolean; agent: Agent }> => {
+  const response = await API_CLIENT.put(`/agents/${id}`, agentData);
+  return response.data;
+};
+
+export const deleteAgent = async (id: string): Promise<{ success: boolean; message: string }> => {
+  const response = await API_CLIENT.delete(`/agents/${id}`);
+  return response.data;
+};
+
+export const deleteDocument = async (id: string): Promise<{ success: boolean; message: string }> => {
+  const response = await API_CLIENT.delete(`/documents/${id}`);
   return response.data;
 };
 
 export default API_CLIENT;
+

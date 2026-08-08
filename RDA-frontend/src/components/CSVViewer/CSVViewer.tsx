@@ -19,23 +19,28 @@ interface CSVViewerProps {
 }
 
 export const CSVViewer = ({
-  data,
-  columns,
-  stats,
-  totalRows,
-  fileName,
+  data = [],
+  columns = [],
+  stats = [],
+  totalRows = 0,
+  fileName = '',
   onQueryClick,
 }: CSVViewerProps) => {
   const [viewMode, setViewMode] = useState<ViewMode>('table');
   const [chartType, setChartType] = useState<CSVChartType>('bar');
 
+  // Enforce array types defensively
+  const safeData = data || [];
+  const safeColumns = columns || [];
+  const safeStats = stats || [];
+
   // Get numeric and categorical columns for charting
-  const numericColumns = columns.filter((c) => c.type === 'number');
-  const categoricalColumns = columns.filter((c) => c.type === 'string');
+  const numericColumns = safeColumns.filter((c) => c?.type === 'number');
+  const categoricalColumns = safeColumns.filter((c) => c?.type === 'string');
 
   // Generate chart data
   const generateChartData = () => {
-    if (numericColumns.length === 0 || categoricalColumns.length === 0) {
+    if (!numericColumns || numericColumns.length === 0 || !categoricalColumns || categoricalColumns.length === 0) {
       return null;
     }
 
@@ -44,7 +49,8 @@ export const CSVViewer = ({
 
     // Aggregate data
     const aggregated: Record<string, { sum: number; count: number }> = {};
-    for (const row of data) {
+    for (const row of safeData) {
+      if (!row) continue;
       const label = String(row[labelCol] || 'Unknown');
       const value = Number(row[valueCol]) || 0;
       if (!aggregated[label]) {
@@ -142,8 +148,8 @@ export const CSVViewer = ({
       {/* Content based on view mode */}
       {viewMode === 'table' && (
         <DataTable
-          data={data}
-          columns={columns}
+          data={safeData}
+          columns={safeColumns}
           totalRows={totalRows}
           fileName={fileName}
         />
@@ -187,9 +193,9 @@ export const CSVViewer = ({
           </CardHeader>
           <CardContent>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {stats.map((stat) => (
+              {safeStats.map((stat) => (
                 <div
-                  key={stat.column}
+                  key={stat?.column}
                   className="bg-muted/30 border border-border/50 rounded-lg p-4 space-y-2"
                 >
                   <div className="flex items-center justify-between">

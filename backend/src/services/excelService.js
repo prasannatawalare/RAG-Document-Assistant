@@ -1,6 +1,10 @@
 import fs from 'fs';
+import path from 'path';
 import XLSX from 'xlsx';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import sandboxService from './sandboxService.js';
+import ragService from './ragService.js';
+import prisma from '../db.js';
 
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
@@ -8,14 +12,8 @@ import { AppError } from '../middleware/errorHandler.js';
 
 class ExcelService {
   constructor() {
-    this.excelData = null;
-    this.columns = [];
-    this.stats = [];
-    this.fileName = null;
-    this.originalFileName = null;
-    this.uploadedAt = null;
-    this.sheetNames = [];
-    this.activeSheet = null;
+    // Map of userId -> { excelData, columns, stats, fileName, originalFileName, uploadedAt, sheetNames, activeSheet }
+    this.userStores = new Map();
 
     // Initialize Gemini
     this.genAI = new GoogleGenerativeAI(config.geminiApiKey);
@@ -30,6 +28,108 @@ class ExcelService {
     });
 
     logger.info('Excel Service initialized');
+  }
+
+  // Helper to fetch or initialize a user's Excel store by docId
+  _getUserStore(userId, docId = 'default') {
+    if (!userId) throw new AppError('userId is required', 400);
+    const key = `${userId}_${docId}`;
+    if (!this.userStores.has(key)) {
+      this.userStores.set(key, {
+        excelData: null,
+        columns: [],
+        stats: [],
+        fileName: null,
+        originalFileName: null,
+        uploadedAt: null,
+        sheetNames: [],
+        activeSheet: null
+      });
+    }
+    return this.userStores.get(key);
+  }
+
+  // Load from disk if not in memory cache (survives restarts & handles multiple files)
+  async _getOrLoadUserStore(userId, docId = null) {
+    if (!userId) throw new AppError('userId is required', 400);
+    
+    let targetDocId = docId;
+    if (!targetDocId) {
+      const recentDoc = await prisma.document.findFirst({
+        where: { userId, fileType: 'xlsx' },
+        orderBy: { createdAt: 'desc' }
+      });
+      if (!recentDoc) return { excelData: [], columns: [], stats: [], sheetNames: [], activeSheet: null };
+      targetDocId = recentDoc.id;
+    }
+
+    const key = `${userId}_${targetDocId}`;
+    if (this.userStores.has(key) && this.userStores.get(key).excelData) {
+      return this.userStores.get(key);
+    }
+
+    // Load from DB & Disk
+    const doc = await prisma.document.findFirst({
+      where: { id: targetDocId, userId }
+    });
+    if (!doc || !fs.existsSync(doc.filePath)) {
+      return { excelData: [], columns: [], stats: [], sheetNames: [], activeSheet: null };
+    }
+
+    // Read and parse workbook
+    const workbook = XLSX.readFile(doc.filePath);
+    const sheetNames = workbook.SheetNames;
+    if (sheetNames.length === 0) {
+      return { excelData: [], columns: [], stats: [], sheetNames: [], activeSheet: null };
+    }
+
+    const activeSheet = sheetNames[0];
+    const worksheet = workbook.Sheets[activeSheet];
+    const records = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
+
+    const store = {
+      excelData: null,
+      columns: [],
+      stats: [],
+      fileName: doc.fileName,
+      originalFileName: doc.originalFileName,
+      uploadedAt: doc.createdAt.toISOString(),
+      filePath: doc.filePath,
+      sheetNames,
+      activeSheet
+    };
+
+    if (records.length > 0) {
+      const columnKeys = Object.keys(records[0]);
+      store.columns = columnKeys.map(key => {
+        const values = records.map(row => row[key]);
+        const type = this.detectColumnType(values);
+        return { key, label: key, type };
+      });
+
+      store.stats = store.columns.map(col => {
+        const values = records.map(row => row[col.key]);
+        return this.calculateColumnStats(col.key, values, col.type);
+      });
+
+      store.excelData = records.map(row => {
+        const processedRow = {};
+        for (const col of store.columns) {
+          const value = row[col.key];
+          if (col.type === 'number' && value !== '' && value !== null && value !== undefined) {
+            processedRow[col.key] = parseFloat(value);
+          } else {
+            processedRow[col.key] = value;
+          }
+        }
+        return processedRow;
+      });
+    } else {
+      store.excelData = [];
+    }
+
+    this.userStores.set(key, store);
+    return store;
   }
 
   // Detect column type (same logic as CSV service)
@@ -85,52 +185,80 @@ class ExcelService {
 
   async processExcel(filePath, options = {}) {
     try {
-      const { originalFileName, mode = 'replace', sheetName } = options;
-      logger.info(`Processing Excel: ${filePath} (mode: ${mode})`);
+      const { originalFileName, mode = 'replace', sheetName, userId } = options;
+      if (!userId) throw new AppError('userId is required to process Excel', 400);
+
+      logger.info(`Processing Excel: ${filePath} for user: ${userId} (mode: ${mode})`);
 
       // Read the workbook
       const workbook = XLSX.readFile(filePath);
-      this.sheetNames = workbook.SheetNames;
+      const sheetNames = workbook.SheetNames;
 
-      if (this.sheetNames.length === 0) {
+      if (sheetNames.length === 0) {
         throw new AppError('Excel file contains no sheets', 400);
       }
 
-      // Use specified sheet or first sheet
-      this.activeSheet = sheetName || this.sheetNames[0];
-      const worksheet = workbook.Sheets[this.activeSheet];
+      const activeSheet = sheetName || sheetNames[0];
+      const worksheet = workbook.Sheets[activeSheet];
 
       if (!worksheet) {
-        throw new AppError(`Sheet "${this.activeSheet}" not found`, 400);
+        throw new AppError(`Sheet "${activeSheet}" not found`, 400);
       }
 
-      // Convert to JSON (array of objects with headers as keys)
+      // Convert to JSON
       const records = XLSX.utils.sheet_to_json(worksheet, { defval: '' });
 
       if (!records || records.length === 0) {
         throw new AppError('Excel sheet is empty or invalid', 400);
       }
 
+      let fullFileName = filePath.split(path.sep).pop() || filePath;
+      const cleanFileName = fullFileName.replace(/^\d+-\d+-/, '');
+
+      // Record document in database first
+      const fileStats = fs.existsSync(filePath) ? fs.statSync(filePath) : { size: 0 };
+      const doc = await prisma.document.create({
+        data: {
+          fileName: cleanFileName,
+          originalFileName: originalFileName || cleanFileName,
+          filePath,
+          fileType: 'xlsx',
+          size: fileStats.size,
+          chunksCount: 0, // Will update below
+          userId
+        }
+      });
+      const docId = doc.id;
+
+      // Associate cache with docId
+      const store = this._getUserStore(userId, docId);
+      store.sheetNames = sheetNames;
+      store.activeSheet = activeSheet;
+      store.fileName = cleanFileName;
+      store.originalFileName = originalFileName || cleanFileName;
+      store.uploadedAt = doc.createdAt.toISOString();
+      store.filePath = filePath;
+
       // Get column names
       const columnKeys = Object.keys(records[0]);
 
       // Detect column types and calculate stats
-      this.columns = columnKeys.map(key => {
+      store.columns = columnKeys.map(key => {
         const values = records.map(row => row[key]);
         const type = this.detectColumnType(values);
         return { key, label: key, type };
       });
 
       // Calculate statistics
-      this.stats = this.columns.map(col => {
+      store.stats = store.columns.map(col => {
         const values = records.map(row => row[col.key]);
         return this.calculateColumnStats(col.key, values, col.type);
       });
 
       // Store data (convert numbers where appropriate)
-      this.excelData = records.map(row => {
+      store.excelData = records.map(row => {
         const processedRow = {};
-        for (const col of this.columns) {
+        for (const col of store.columns) {
           const value = row[col.key];
           if (col.type === 'number' && value !== '' && value !== null && value !== undefined) {
             processedRow[col.key] = parseFloat(value);
@@ -141,114 +269,88 @@ class ExcelService {
         return processedRow;
       });
 
-      // Extract filename
-      let fullFileName;
-      if (filePath.includes('\\')) {
-        fullFileName = filePath.split('\\').pop();
-      } else if (filePath.includes('/')) {
-        fullFileName = filePath.split('/').pop();
-      } else {
-        fullFileName = filePath;
+      // Convert Excel rows to text chunks for RAG indexing
+      const maxRowsPerChunk = 25;
+      const RAGDocs = [];
+      
+      for (let i = 0; i < store.excelData.length; i += maxRowsPerChunk) {
+        const rowSlice = store.excelData.slice(i, i + maxRowsPerChunk);
+        const chunkText = rowSlice.map((row, idx) => {
+          const rowIdx = i + idx + 1;
+          const rowStr = Object.entries(row)
+            .map(([key, val]) => `${key}: ${val}`)
+            .join(', ');
+          return `[Row ${rowIdx}] ${rowStr}`;
+        }).join('\n');
+
+        RAGDocs.push({
+          pageContent: `Document: ${cleanFileName} (Sheet: ${activeSheet})\nColumns: ${columnKeys.join(', ')}\nRows ${i + 1} to ${i + rowSlice.length} of ${store.excelData.length}:\n${chunkText}`,
+          metadata: {
+            source: cleanFileName,
+            originalFileName: originalFileName || cleanFileName,
+            filePath,
+            startRow: i + 1,
+            endRow: i + rowSlice.length,
+          }
+        });
       }
-      const cleanFileName = fullFileName.replace(/^\d+-\d+-/, '');
 
-      this.fileName = cleanFileName;
-      this.originalFileName = originalFileName || cleanFileName;
-      this.uploadedAt = new Date().toISOString();
+      // Index in RAG service using processRawText
+      await ragService.processRawText(RAGDocs, {
+        mode: mode,
+        cleanFileName,
+        fullFileName: originalFileName || cleanFileName,
+        filePath,
+        userId
+      });
 
-      logger.info(`Excel processed: ${this.excelData.length} rows, ${this.columns.length} columns, sheet: "${this.activeSheet}"`);
+      // Update DB with the correct chunksCount
+      await prisma.document.update({
+        where: { id: docId },
+        data: { chunksCount: RAGDocs.length }
+      });
+
+      logger.info(`Excel processed: ${store.excelData.length} rows, ${store.columns.length} columns, ${RAGDocs.length} chunks for user ${userId}`);
 
       return {
         success: true,
-        fileName: this.fileName,
-        originalFileName: this.originalFileName,
-        rowCount: this.excelData.length,
-        columnCount: this.columns.length,
-        columns: this.columns,
-        sheetNames: this.sheetNames,
-        activeSheet: this.activeSheet,
-        preview: this.excelData.slice(0, 10),
-        stats: this.stats,
-        message: `Excel file processed successfully. Sheet "${this.activeSheet}": ${this.excelData.length} rows, ${this.columns.length} columns.`
+        documentId: docId,
+        fileName: store.fileName,
+        originalFileName: store.originalFileName,
+        rowCount: store.excelData.length,
+        columnCount: store.columns.length,
+        columns: store.columns,
+        sheetNames: store.sheetNames,
+        activeSheet: store.activeSheet,
+        preview: store.excelData.slice(0, 10),
+        stats: store.stats,
+        message: `Excel sheet "${store.activeSheet}" processed successfully. ${store.excelData.length} rows, ${store.columns.length} columns.`
       };
     } catch (error) {
       logger.error('Error processing Excel:', error);
       if (error instanceof AppError) throw error;
-      throw new AppError(`Failed to process Excel file: ${error.message}`, 500);
+      throw new AppError(`Failed to process Excel: ${error.message}`, 500);
     }
   }
 
-  async queryExcel(question) {
+  async queryExcel(question, userId, docId = null) {
     try {
-      if (!this.excelData || this.excelData.length === 0) {
+      const store = await this._getOrLoadUserStore(userId, docId);
+
+      if (!store.excelData || store.excelData.length === 0) {
         throw new AppError('No Excel data loaded. Please upload an Excel file first.', 400);
       }
 
-      logger.info(`Processing Excel query: "${question}"`);
+      logger.info(`Processing Excel query for user ${userId} (doc: ${docId || 'recent'}): "${question}"`);
 
-      const columnInfo = this.columns.map(col => {
-        const stat = this.stats.find(s => s.column === col.key);
-        let info = `${col.key} (${col.type})`;
-        if (stat) {
-          if (col.type === 'number') {
-            info += ` - min: ${stat.min}, max: ${stat.max}, mean: ${stat.mean?.toFixed(2)}`;
-          }
-          info += `, unique values: ${stat.unique}`;
-        }
-        return info;
-      }).join('\n  ');
-
-      const sampleData = JSON.stringify(this.excelData.slice(0, 5), null, 2);
-
-      const prompt = `You are a data analyst assistant. You have access to an Excel dataset with the following structure:
-
-File: ${this.fileName} (Sheet: ${this.activeSheet})
-Total Rows: ${this.excelData.length}
-Available Sheets: ${this.sheetNames.join(', ')}
-Columns:
-  ${columnInfo}
-
-Sample Data (first 5 rows):
-${sampleData}
-
-User Question: ${question}
-
-Instructions:
-1. Analyze the question and provide a clear, helpful answer based on the data.
-2. If the question requires calculations, show the calculation and result.
-3. If you need to reference specific data, be precise.
-4. If the question asks for visualization/chart, describe what type of chart would be appropriate.
-5. Format numbers nicely (use commas for thousands, round decimals appropriately).
-6. If you cannot answer the question with the available data, explain why.
-
-Provide your answer in a clear, structured format.`;
-
-      const result = await this.model.generateContent(prompt);
-      const answer = result.response.text();
-
-      // Chart detection (same as CSV)
-      let chartData = null;
-      const chartKeywords = ['chart', 'graph', 'plot', 'visualize', 'show me', 'distribution', 'trend', 'compare', 'top 10', 'top 5', 'top ten', 'top five', 'highest', 'lowest', 'bar chart', 'pie chart'];
-      const wantsChart = chartKeywords.some(kw => question.toLowerCase().includes(kw));
-
-      if (wantsChart) {
-        chartData = this.generateChartData(question);
-      }
-
-      logger.info('Excel query processed successfully');
-
-      return {
-        success: true,
-        answer,
-        chartData,
-        metadata: {
-          question,
-          timestamp: new Date().toISOString(),
-          rowsAnalyzed: this.excelData.length,
-          fileName: this.fileName,
-          activeSheet: this.activeSheet
-        }
-      };
+      // Prepare data summary for the AI
+      return await sandboxService.analyzeTabularFile(
+        question,
+        store.filePath,
+        'excel',
+        store.columns,
+        store.excelData.slice(0, 5)
+      );
     } catch (error) {
       logger.error('Error processing Excel query:', error);
       if (error instanceof AppError) throw error;
@@ -256,11 +358,13 @@ Provide your answer in a clear, structured format.`;
     }
   }
 
-  generateChartData(question) {
+  async generateChartData(question, userId, docId = null) {
     try {
+      const store = await this._getOrLoadUserStore(userId, docId);
       const questionLower = question.toLowerCase();
-      const numericCols = this.columns.filter(c => c.type === 'number');
-      const categoricalCols = this.columns.filter(c => c.type === 'string');
+
+      const numericCols = store.columns.filter(c => c.type === 'number');
+      const categoricalCols = store.columns.filter(c => c.type === 'string');
 
       if (numericCols.length === 0) return null;
 
@@ -286,15 +390,18 @@ Provide your answer in a clear, structured format.`;
 
       if (!valueCol) valueCol = numericCols[0]?.key;
       if (!labelCol) labelCol = categoricalCols[0]?.key;
+
       if (!labelCol || !valueCol) return null;
 
       let topN = 10;
       const topMatch = questionLower.match(/top\s*(\d+)/);
-      if (topMatch) topN = parseInt(topMatch[1], 10);
+      if (topMatch) {
+        topN = parseInt(topMatch[1], 10);
+      }
 
       const isDescending = !questionLower.includes('lowest') && !questionLower.includes('bottom');
 
-      const sortedData = [...this.excelData]
+      const sortedData = [...store.excelData]
         .filter(row => row[valueCol] !== null && row[valueCol] !== undefined && row[valueCol] !== '')
         .sort((a, b) => {
           const aVal = parseFloat(a[valueCol]) || 0;
@@ -311,68 +418,70 @@ Provide your answer in a clear, structured format.`;
       else if (questionLower.includes('line') || questionLower.includes('trend')) chartType = 'line';
       else if (questionLower.includes('area')) chartType = 'area';
 
-      logger.info(`Generated Excel chart: ${chartType} with ${labels.length} items`);
-
       return {
         type: chartType,
         labels,
-        datasets: [{ label: valueCol, data }]
+        datasets: [{
+          label: `${valueCol}`,
+          data
+        }]
       };
     } catch (error) {
-      logger.error('Error generating Excel chart data:', error);
+      logger.error('Error generating chart data:', error);
       return null;
     }
   }
 
-  getData(limit = 100, offset = 0) {
-    if (!this.excelData) {
+  async getData(userId, limit = 100, offset = 0, docId = null) {
+    const store = await this._getOrLoadUserStore(userId, docId);
+    if (!store.excelData) {
       return { success: false, error: 'No Excel data loaded' };
     }
 
+    const paginatedData = store.excelData.slice(offset, offset + limit);
+
     return {
       success: true,
-      data: this.excelData.slice(offset, offset + limit),
-      columns: this.columns,
-      totalRows: this.excelData.length,
+      data: paginatedData,
+      columns: store.columns,
+      totalRows: store.excelData.length,
       limit,
       offset,
-      fileName: this.fileName,
-      sheetNames: this.sheetNames,
-      activeSheet: this.activeSheet
+      fileName: store.fileName,
+      sheetNames: store.sheetNames,
+      activeSheet: store.activeSheet
     };
   }
 
-  getStats() {
-    if (!this.excelData) {
+  async getStats(userId, docId = null) {
+    const store = await this._getOrLoadUserStore(userId, docId);
+    if (!store.excelData) {
       return { success: false, error: 'No Excel data loaded' };
     }
 
     return {
       success: true,
-      stats: this.stats,
-      columns: this.columns,
-      fileName: this.fileName,
-      rowCount: this.excelData.length,
-      sheetNames: this.sheetNames,
-      activeSheet: this.activeSheet,
-      uploadedAt: this.uploadedAt
+      stats: store.stats,
+      columns: store.columns,
+      fileName: store.fileName,
+      rowCount: store.excelData.length,
+      sheetNames: store.sheetNames,
+      activeSheet: store.activeSheet,
+      uploadedAt: store.uploadedAt
     };
   }
 
-  hasData() {
-    return this.excelData !== null && this.excelData.length > 0;
-  }
-
-  reset() {
-    this.excelData = null;
-    this.columns = [];
-    this.stats = [];
-    this.fileName = null;
-    this.originalFileName = null;
-    this.uploadedAt = null;
-    this.sheetNames = [];
-    this.activeSheet = null;
-    logger.info('Excel service reset');
+  reset(userId) {
+    if (userId) {
+      for (const key of this.userStores.keys()) {
+        if (key.startsWith(`${userId}_`)) {
+          this.userStores.delete(key);
+        }
+      }
+    } else {
+      this.userStores.clear();
+    }
+    logger.info(`Excel data cleared for user: ${userId || 'all'}`);
     return { success: true, message: 'Excel data cleared' };
   }
 }

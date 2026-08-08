@@ -10,6 +10,7 @@ export interface SourceDocument {
     filePath: string;
     chunkIndex: number;
     uploadedAt: string;
+    pageNumber?: number;
   };
 }
 
@@ -91,12 +92,15 @@ export interface DocumentUploadResponse {
 
 // Backend document list item
 export interface UploadedDocument {
+  id: string;
   fileName: string;
   originalFileName: string;
   filePath: string;
   chunksCount: number;
   uploadedAt: string;
   mode: string;
+  size?: number;
+  fileType?: string;
 }
 
 // Backend document list response
